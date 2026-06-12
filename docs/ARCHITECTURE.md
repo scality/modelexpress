@@ -530,10 +530,13 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
+| `obj_transfer.py` | NIXL OBJ availability check and `ObjTransferManager` for object-to-GPU transfers (engine-agnostic: S3 / S3 CRT / accelerated engines via `MX_OBJ_PARAMS`) |
+| `obj_loader.py` | `MxObjLoader` - object-store model loader (direct object-to-GPU) |
+| `safetensors_meta.py` | Source-agnostic safetensors header parsing shared by the GDS and OBJ loaders |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection |
-| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
+| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ObjStrategy` (object-store via NIXL OBJ plugin), `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
 | `engines/vllm/` | `VllmAdapter` and `MxModelLoader` - maps strategy hooks to vLLM loader APIs and post-load lifecycle |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
@@ -594,10 +597,11 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
-| p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). Candidate retry covers pre-transfer metadata misses only (no metadata found, fetch error). Once the RDMA receive starts, a `SourceTransferError` or `ManifestMismatchError` aborts RDMA and the chain falls through to the next strategy (GDS, then disk), not the next source. |
-| p1 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
-| p2 | `GdsStrategy` | GDS hardware available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. |
-| p3 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
+| p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank`, shuffle, try candidates (max 3). Candidate retry covers pre-transfer metadata misses only (no metadata found, fetch error). Once the RDMA receive starts, a `SourceTransferError` or `ManifestMismatchError` aborts RDMA and the chain falls through to the next strategy (OBJ, GDS, then disk), not the next source. |
+| p1 | `ObjStrategy` | NIXL OBJ plugin loadable + `MX_OBJ_URI` set | Load via `MxObjLoader` (direct object-to-GPU using the NIXL OBJ plugin). Engine-agnostic: plain S3, S3 CRT, or a GPU-direct accelerated engine, selected via the `MX_OBJ_PARAMS` backend-parameter map (passed verbatim to the NIXL OBJ backend). The shard layout is resolved from the model metadata; weight bytes are read directly from the object store. Falls through on failure. Zero-copy alternative to `ModelStreamerStrategy`, so it runs first. |
+| p2 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
+| p3 | `GdsStrategy` | GDS hardware available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. |
+| p4 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
 
 Strategies handle the loading path and NIXL tensor registration. Adapter hooks handle engine lifecycle such as vLLM `process_weights_after_loading`, and the chain performs best-effort metadata publication after a successful strategy. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
 

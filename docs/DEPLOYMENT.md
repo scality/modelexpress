@@ -401,6 +401,10 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_VMM_ARENA` | `0` | Route weight allocations into a CUDA VMM arena via PyTorch's `CUDAPluggableAllocator`, then register the used arena range as one NIXL MR with dmabuf at end-of-load. Reserves 16.0 TiB of VA by default, with no physical commit until allocations are mapped. Requires the `modelexpress.vmm._alloc_ext` C extension to have built at install time; if it did not, this flag is a no-op with a warning and the loader falls back to the pool-reg path. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
 | `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
+| `MX_OBJ_URI` | (unset) | Object key prefix where the model's safetensors shards live. Set to enable `ObjStrategy` — see [Object-Store (OBJ) Backend](#object-store-obj-backend). |
+| `MX_OBJ_PARAMS` | `{}` | JSON object of NIXL OBJ backend parameters, passed verbatim to the backend. Selects the engine and its connection settings (`type`, `accelerated`, `endpoint_override`, `bucket`, `region`, `crtMinLimit`, `num_threads`, credentials, ...). See the NIXL OBJ plugin README for the full vocabulary. |
+| `MX_OBJ_MAX_CHUNK_KB` | `131072` (128 MB) | Maximum chunk size for OBJ transfers; capped at the 4 GiB cuObject registration limit. |
+| `MX_OBJ_TIMEOUT` | `300` | OBJ transfer timeout in seconds. |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
@@ -435,6 +439,54 @@ do not interoperate. Confirm via worker logs:
 ```
 NIXL agent 'mx-auto-worker0-...' created on device 0 (backend=LIBFABRIC)
 ```
+
+### Object-Store (OBJ) Backend
+
+`ObjStrategy` loads safetensors weights directly from an object store
+into GPU memory using the NIXL OBJ plugin. The plugin is
+engine-agnostic: the same strategy drives plain AWS S3, the
+high-performance S3 CRT client, or a GPU-direct accelerated engine
+(e.g. `dell`, `scality_ai_connector`). It is the zero-copy alternative
+to `ModelStreamerStrategy` (which stages through host memory), so it
+runs ahead of it in the chain.
+
+Enable it by setting `MX_OBJ_URI` (the object key prefix for the
+model's shards) and `MX_OBJ_PARAMS` (a JSON map of OBJ backend
+parameters passed verbatim to the backend). The engine and its
+connection are selected entirely through `MX_OBJ_PARAMS`; ModelExpress
+does not hardcode any provider. Examples:
+
+```bash
+# Plain S3-compatible store
+export MX_OBJ_URI="my-models/llama-3-8b"
+export MX_OBJ_PARAMS='{"bucket":"my-models","region":"us-east-1","endpoint_override":"https://s3.example.com"}'
+
+# GPU-direct accelerated engine (RDMA), e.g. Scality AI Connector
+export MX_OBJ_URI="my-models/llama-3-8b"
+export MX_OBJ_PARAMS='{"accelerated":"true","type":"scality_ai_connector","endpoint_override":"http://10.0.0.1:81"}'
+```
+
+The shard layout (`model.safetensors.index.json` / `model.safetensors`)
+is resolved from the model metadata referenced by the engine config;
+only that small metadata is read locally, while the weight bytes are
+read from the object store.
+
+Runtime prerequisites:
+
+- The NIXL OBJ plugin (`libplugin_OBJ.so`) must be loadable. Set
+  `NIXL_PLUGIN_DIR` to its directory if it is not on the default
+  plugin path.
+- Accelerated, GPU-direct engines additionally require NVIDIA cuObject
+  / GPUDirect Storage and an RDMA-capable fabric. Point
+  `CUFILE_ENV_PATH_JSON` at `/etc/cufile.json` with `rdma_dev_addr_list`
+  set for your fabric. Plain S3 / S3 CRT engines do not need cuObject.
+
+When `ObjStrategy` is unavailable (plugin missing, params unset, or a
+backend prerequisite not ready) the chain transparently falls through
+to `ModelStreamerStrategy`, `GdsStrategy`, then the engine-native
+loader. After a successful OBJ load the worker registers its tensors
+with NIXL and publishes itself as a P2P source, so peers can clone from
+it over UCX RDMA.
 
 ### NIC Pinning (UCX Workaround)
 
