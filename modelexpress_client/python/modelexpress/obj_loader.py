@@ -25,9 +25,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import queue
 import re
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator
@@ -41,6 +44,23 @@ logger = logging.getLogger("modelexpress.obj_loader")
 
 # Leading "<scheme>://" on an object URI, stripped to get the key prefix.
 _URI_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+
+def _configured_load_workers() -> int:
+    """Number of shard objects to load concurrently (MX_OBJ_LOAD_WORKERS, default 1).
+
+    Each worker drives its own transfer agent, so this is also the number of
+    NIXL agents created. 1 reproduces the classic single-in-flight pipeline.
+    A single ObjTransferManager is not thread-safe, so concurrency comes from
+    independent managers, one per worker.
+    """
+    raw = os.environ.get("MX_OBJ_LOAD_WORKERS", "1")
+    try:
+        n = int(raw)
+    except ValueError:
+        logger.warning("Invalid MX_OBJ_LOAD_WORKERS=%r; using 1", raw)
+        return 1
+    return max(1, n)
 
 
 class MxObjLoader:
@@ -58,7 +78,7 @@ class MxObjLoader:
     """
 
     def __init__(self):
-        self._obj_manager: ObjTransferManager | None = None
+        self._obj_managers: list[ObjTransferManager] = []
         self._device_id: int | None = None
 
     # ------------------------------------------------------------------
@@ -93,7 +113,9 @@ class MxObjLoader:
             )
 
         self._device_id = torch.cuda.current_device()
-        self._ensure_obj_manager()
+        # One manager is enough to parse the shard headers below; the full
+        # worker pool is sized once the shard count is known.
+        self._ensure_obj_managers(1)
 
         prefix = self._normalize_prefix(object_prefix)
         shard_basenames = self._resolve_shard_basenames(model_ref, revision=revision)
@@ -111,6 +133,9 @@ class MxObjLoader:
             return
 
         total = len(shard_jobs)
+        workers = min(_configured_load_workers(), total)
+        self._ensure_obj_managers(workers)
+
         pbar = None
         if use_tqdm:
             from tqdm import tqdm
@@ -120,25 +145,49 @@ class MxObjLoader:
                 unit="shard",
             )
 
-        # Prefetch pipeline: load shard[i+1] while yielding shard[i].
-        pool = ThreadPoolExecutor(max_workers=1)
-        try:
-            pending = pool.submit(self._load_object_tensors, *shard_jobs[0])
+        # Concurrent prefetch: `workers` transfer agents load shards in parallel
+        # (agents are not thread-safe, so one manager per worker). Tensors are
+        # emitted strictly in shard order via a FIFO window. The window is kept
+        # deeper than `workers` (submitted-but-not-yet-emitted futures) so that
+        # an out-of-order early finisher never leaves an agent idle behind a
+        # straggler: freed agents always have queued work. Memory is bounded to
+        # `depth` shards. workers=1 reproduces the classic 1-ahead pipeline.
+        depth = min(2 * workers, total)
+        mgr_pool: queue.Queue[ObjTransferManager] = queue.Queue()
+        for mgr in self._obj_managers[:workers]:
+            mgr_pool.put(mgr)
 
-            for i in range(total):
-                loaded = pending.result()
+        def _worker(job: tuple[str, dict]) -> dict[str, torch.Tensor]:
+            mgr = mgr_pool.get()
+            try:
+                return self._load_object_tensors(*job, manager=mgr)
+            finally:
+                mgr_pool.put(mgr)
+
+        pool = ThreadPoolExecutor(max_workers=workers)
+        window: deque = deque()
+        try:
+            next_idx = 0
+            while next_idx < total and len(window) < depth:
+                window.append(pool.submit(_worker, shard_jobs[next_idx]))
+                next_idx += 1
+
+            while window:
+                loaded = window.popleft().result()
                 if pbar is not None:
                     pbar.update(1)
 
-                if i + 1 < total:
-                    pending = pool.submit(
-                        self._load_object_tensors, *shard_jobs[i + 1]
-                    )
+                if next_idx < total:
+                    window.append(pool.submit(_worker, shard_jobs[next_idx]))
+                    next_idx += 1
 
                 for name, tensor in loaded.items():
                     yield name, tensor
 
-            logger.info("OBJ load complete in %.2fs", time.perf_counter() - load_start)
+            logger.info(
+                "OBJ load complete in %.2fs (workers=%d)",
+                time.perf_counter() - load_start, workers,
+            )
         finally:
             if pbar is not None:
                 pbar.close()
@@ -159,14 +208,21 @@ class MxObjLoader:
         """Join the key prefix and a shard basename into an object key."""
         return f"{prefix}/{basename}" if prefix else basename
 
-    def _ensure_obj_manager(self) -> None:
-        """Lazily create and initialize the OBJ transfer manager."""
-        if self._obj_manager is not None:
-            return
-        agent_name = f"mx-obj-{self._device_id}-{uuid.uuid4().hex[:8]}"
-        self._obj_manager = ObjTransferManager(agent_name=agent_name)
-        self._obj_manager.initialize()
-        logger.info("OBJ manager initialized for device %d", self._device_id)
+    def _ensure_obj_managers(self, count: int) -> None:
+        """Lazily create and initialize up to `count` OBJ transfer managers.
+
+        Each manager is an independent NIXL agent (unique name). Managers are
+        created once and reused; growing the pool is idempotent.
+        """
+        while len(self._obj_managers) < count:
+            agent_name = f"mx-obj-{self._device_id}-{uuid.uuid4().hex[:8]}"
+            mgr = ObjTransferManager(agent_name=agent_name)
+            mgr.initialize()
+            self._obj_managers.append(mgr)
+        logger.info(
+            "OBJ managers ready: %d (device %d)",
+            len(self._obj_managers), self._device_id,
+        )
 
     @staticmethod
     def _resolve_metadata_dir(
@@ -223,7 +279,7 @@ class MxObjLoader:
     ) -> dict[str, dict]:
         """Parse a shard object's safetensors header via ranged RDMA GETs."""
         def read_fn(offset: int, length: int) -> bytes:
-            return self._obj_manager.read_object_range(
+            return self._obj_managers[0].read_object_range(
                 object_key, offset, length, device
             )
 
@@ -233,8 +289,14 @@ class MxObjLoader:
         self,
         object_key: str,
         tensor_infos: dict[str, dict],
+        manager: ObjTransferManager | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Load all tensors of one shard object via a single OBJ batch transfer."""
+        """Load all tensors of one shard object via a single OBJ batch transfer.
+
+        `manager` selects the transfer agent (one per concurrent worker);
+        defaults to the first pool member for the single-worker path.
+        """
+        obj_manager = manager if manager is not None else self._obj_managers[0]
         device = torch.device("cuda", self._device_id)
 
         sorted_names = sorted(
@@ -255,7 +317,7 @@ class MxObjLoader:
             range_list.append((info["offset"], info["size"]))
             tensor_meta.append((name, torch_dtype, info["shape"]))
 
-        raw_tensors = self._obj_manager.batch_load_object(
+        raw_tensors = obj_manager.batch_load_object(
             object_key, range_list, device,
         )
 
@@ -267,7 +329,7 @@ class MxObjLoader:
         return result
 
     def shutdown(self) -> None:
-        """Release OBJ resources."""
-        if self._obj_manager is not None:
-            self._obj_manager.shutdown()
-            self._obj_manager = None
+        """Release OBJ resources (all transfer agents in the pool)."""
+        for mgr in self._obj_managers:
+            mgr.shutdown()
+        self._obj_managers = []

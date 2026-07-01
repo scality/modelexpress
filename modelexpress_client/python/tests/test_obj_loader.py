@@ -5,6 +5,8 @@
 
 import json
 import struct
+import threading
+import time
 from unittest.mock import patch
 
 import pytest
@@ -209,3 +211,164 @@ class TestResolveShardBasenames:
         ):
             with pytest.raises(FileNotFoundError, match="No safetensors"):
                 loader._resolve_shard_basenames("org/model")
+
+
+# ---------------------------------------------------------------------------
+# Concurrent load pipeline (MX_OBJ_LOAD_WORKERS)
+# ---------------------------------------------------------------------------
+
+
+class _FakeManager:
+    """Stand-in for ObjTransferManager: tracks lifecycle + concurrent use."""
+
+    def __init__(self, agent_name=None, params=None):
+        self.agent_name = agent_name
+        self.initialized = False
+        self.shut = False
+        self.max_in_use = 0
+        self._in_use = 0
+        self._lock = threading.Lock()
+
+    def initialize(self):
+        self.initialized = True
+
+    def shutdown(self):
+        self.shut = True
+
+    # Called from worker threads via _load_object_tensors.
+    def enter(self):
+        with self._lock:
+            self._in_use += 1
+            self.max_in_use = max(self.max_in_use, self._in_use)
+
+    def leave(self):
+        with self._lock:
+            self._in_use -= 1
+
+
+def _build_index(tmp_path, n_shards, per_shard=2):
+    """Write an index.json; return (basenames, tensors_by_basename, ordered)."""
+    basenames = [f"model-{i:05d}-of-{n_shards:05d}.safetensors" for i in range(n_shards)]
+    tensors = {b: [f"{b}::t{j}" for j in range(per_shard)] for b in basenames}
+    weight_map = {t: b for b in basenames for t in tensors[b]}
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    # Expected yield order: shards sorted, tensors in offset order within a shard.
+    ordered = [t for b in sorted(basenames) for t in tensors[b]]
+    return basenames, tensors, ordered
+
+
+class TestLoadIterConcurrency:
+    """The MX_OBJ_LOAD_WORKERS parallel prefetch: order, pooling, isolation."""
+
+    def _run(self, tmp_path, monkeypatch, workers, n_shards=6):
+        from modelexpress import obj_loader
+        from modelexpress.obj_loader import MxObjLoader
+
+        _basenames, tensors, ordered = _build_index(tmp_path, n_shards)
+
+        created: list[_FakeManager] = []
+
+        def _make_manager(agent_name=None, params=None):
+            m = _FakeManager(agent_name=agent_name)
+            created.append(m)
+            return m
+
+        global_lock = threading.Lock()
+        state = {"cur": 0, "max": 0}
+
+        def fake_parse(self, object_key, device):
+            basename = object_key.split("/")[-1]
+            return {t: {"offset": j} for j, t in enumerate(tensors[basename])}
+
+        def fake_load(self, object_key, tensor_infos, manager=None):
+            assert isinstance(manager, _FakeManager) and manager.initialized
+            manager.enter()
+            with global_lock:
+                state["cur"] += 1
+                state["max"] = max(state["max"], state["cur"])
+            try:
+                time.sleep(0.02)  # widen the concurrency window
+            finally:
+                with global_lock:
+                    state["cur"] -= 1
+                manager.leave()
+            names = sorted(tensor_infos, key=lambda n: tensor_infos[n]["offset"])
+            return {n: object_key for n in names}
+
+        monkeypatch.setenv("MX_OBJ_LOAD_WORKERS", str(workers))
+        with patch.object(obj_loader, "ObjTransferManager", _make_manager), \
+             patch.object(obj_loader, "is_obj_available", return_value=True), \
+             patch.object(torch.cuda, "current_device", return_value=0), \
+             patch.object(MxObjLoader, "_resolve_metadata_dir", return_value=str(tmp_path)), \
+             patch.object(MxObjLoader, "_parse_object_header", fake_parse), \
+             patch.object(MxObjLoader, "_load_object_tensors", fake_load):
+            loader = MxObjLoader()
+            got = [name for name, _ in loader.load_iter("org/model", "buck/pfx", use_tqdm=False)]
+            loader.shutdown()
+
+        return got, ordered, created, state
+
+    def test_single_worker_regression(self, tmp_path, monkeypatch):
+        got, ordered, created, state = self._run(tmp_path, monkeypatch, workers=1)
+        assert got == ordered                       # order unchanged
+        assert len(created) == 1                     # single agent
+        assert state["max"] == 1                     # never more than one in flight
+        assert all(m.shut for m in created)          # torn down
+
+    def test_multi_worker_order_and_pool(self, tmp_path, monkeypatch):
+        got, ordered, created, state = self._run(tmp_path, monkeypatch, workers=4, n_shards=6)
+        assert got == ordered                        # identical order to K=1
+        assert len(created) == 4                      # exactly K agents (pool reused)
+        assert all(m.initialized and m.shut for m in created)
+        assert state["max"] >= 2                       # genuine concurrency
+        assert all(m.max_in_use == 1 for m in created)  # no agent shared across threads
+
+    def test_workers_clamped_to_shard_count(self, tmp_path, monkeypatch):
+        got, ordered, created, _ = self._run(tmp_path, monkeypatch, workers=32, n_shards=3)
+        assert got == ordered
+        assert len(created) == 3                      # min(workers, shards)
+
+    def test_worker_error_propagates_and_shuts_down(self, tmp_path, monkeypatch):
+        from modelexpress import obj_loader
+        from modelexpress.obj_loader import MxObjLoader
+
+        _basenames, tensors, _ordered = _build_index(tmp_path, 4)
+        created: list[_FakeManager] = []
+
+        def _make_manager(agent_name=None, params=None):
+            m = _FakeManager(agent_name=agent_name)
+            created.append(m)
+            return m
+
+        def fake_parse(self, object_key, device):
+            basename = object_key.split("/")[-1]
+            return {t: {"offset": j} for j, t in enumerate(tensors[basename])}
+
+        def fake_load(self, object_key, tensor_infos, manager=None):
+            raise RuntimeError("boom")
+
+        monkeypatch.setenv("MX_OBJ_LOAD_WORKERS", "4")
+        with patch.object(obj_loader, "ObjTransferManager", _make_manager), \
+             patch.object(obj_loader, "is_obj_available", return_value=True), \
+             patch.object(torch.cuda, "current_device", return_value=0), \
+             patch.object(MxObjLoader, "_resolve_metadata_dir", return_value=str(tmp_path)), \
+             patch.object(MxObjLoader, "_parse_object_header", fake_parse), \
+             patch.object(MxObjLoader, "_load_object_tensors", fake_load):
+            loader = MxObjLoader()
+            with pytest.raises(RuntimeError, match="boom"):
+                list(loader.load_iter("org/model", "buck/pfx", use_tqdm=False))
+            loader.shutdown()
+
+        assert created and all(m.shut for m in created)
+
+    def test_invalid_workers_defaults_to_one(self, monkeypatch):
+        from modelexpress.obj_loader import _configured_load_workers
+
+        monkeypatch.setenv("MX_OBJ_LOAD_WORKERS", "not-a-number")
+        assert _configured_load_workers() == 1
+        monkeypatch.setenv("MX_OBJ_LOAD_WORKERS", "0")
+        assert _configured_load_workers() == 1
+        monkeypatch.delenv("MX_OBJ_LOAD_WORKERS", raising=False)
+        assert _configured_load_workers() == 1
