@@ -60,6 +60,23 @@ class MxObjLoader:
     def __init__(self):
         self._obj_manager: ObjTransferManager | None = None
         self._device_id: int | None = None
+        import threading
+        self._tls = threading.local()
+        self._worker_mgrs = []
+        self._worker_lock = threading.Lock()
+
+    def _worker_manager(self):
+        # One ObjTransferManager (NIXL agent) per prefetch worker thread -- the agent is not
+        # safe for concurrent batch transfers, so parallel shards each get their own.
+        mgr = getattr(self._tls, "mgr", None)
+        if mgr is None:
+            import threading as _th
+            mgr = ObjTransferManager(agent_name=f"mx-obj-{self._device_id}-{_th.get_ident()}")
+            mgr.initialize()
+            with self._worker_lock:
+                self._worker_mgrs.append(mgr)
+            self._tls.mgr = mgr
+        return mgr
 
     # ------------------------------------------------------------------
     # Public API
@@ -120,29 +137,36 @@ class MxObjLoader:
                 unit="shard",
             )
 
-        # Prefetch pipeline: load shard[i+1] while yielding shard[i].
-        pool = ThreadPoolExecutor(max_workers=1)
+        # Prefetch pipeline: keep up to MX_OBJ_PREFETCH shards in flight (default 1 = legacy serial).
+        import os as _os
+        depth = max(1, int(_os.environ.get("MX_OBJ_PREFETCH", "1")))
+        pool = ThreadPoolExecutor(max_workers=depth)
         try:
-            pending = pool.submit(self._load_object_tensors, *shard_jobs[0])
-
+            futures = {}
+            nxt = 0
+            while nxt < min(depth, total):
+                futures[nxt] = pool.submit(self._load_object_tensors, *shard_jobs[nxt])
+                nxt += 1
             for i in range(total):
-                loaded = pending.result()
+                loaded = futures.pop(i).result()
                 if pbar is not None:
                     pbar.update(1)
-
-                if i + 1 < total:
-                    pending = pool.submit(
-                        self._load_object_tensors, *shard_jobs[i + 1]
-                    )
-
+                if nxt < total:
+                    futures[nxt] = pool.submit(self._load_object_tensors, *shard_jobs[nxt])
+                    nxt += 1
                 for name, tensor in loaded.items():
                     yield name, tensor
-
-            logger.info("OBJ load complete in %.2fs", time.perf_counter() - load_start)
+            logger.info("OBJ load complete in %.2fs (prefetch=%d)", time.perf_counter() - load_start, depth)
         finally:
             if pbar is not None:
                 pbar.close()
             pool.shutdown(wait=True)
+            for _mgr in self._worker_mgrs:
+                try:
+                    _mgr.shutdown()
+                except Exception:
+                    pass
+            self._worker_mgrs = []
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -255,7 +279,7 @@ class MxObjLoader:
             range_list.append((info["offset"], info["size"]))
             tensor_meta.append((name, torch_dtype, info["shape"]))
 
-        raw_tensors = self._obj_manager.batch_load_object(
+        raw_tensors = self._worker_manager().batch_load_object(
             object_key, range_list, device,
         )
 
