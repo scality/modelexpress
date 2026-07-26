@@ -28,7 +28,6 @@ import logging
 import re
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterator
 
@@ -60,23 +59,6 @@ class MxObjLoader:
     def __init__(self):
         self._obj_manager: ObjTransferManager | None = None
         self._device_id: int | None = None
-        import threading
-        self._tls = threading.local()
-        self._worker_mgrs = []
-        self._worker_lock = threading.Lock()
-
-    def _worker_manager(self):
-        # One ObjTransferManager (NIXL agent) per prefetch worker thread -- the agent is not
-        # safe for concurrent batch transfers, so parallel shards each get their own.
-        mgr = getattr(self._tls, "mgr", None)
-        if mgr is None:
-            import threading as _th
-            mgr = ObjTransferManager(agent_name=f"mx-obj-{self._device_id}-{_th.get_ident()}")
-            mgr.initialize()
-            with self._worker_lock:
-                self._worker_mgrs.append(mgr)
-            self._tls.mgr = mgr
-        return mgr
 
     # ------------------------------------------------------------------
     # Public API
@@ -137,36 +119,29 @@ class MxObjLoader:
                 unit="shard",
             )
 
-        # Prefetch pipeline: keep up to MX_OBJ_PREFETCH shards in flight (default 1 = legacy serial).
+        # Single-agent windowed multi-shard batch: register a window of W
+        # shards up-front and submit them as ONE batched NIXL transfer on the
+        # SAME singleton agent used for header reads, then yield tensors in any
+        # order (vLLM load_weights is name-matched / order-agnostic). One
+        # thread => no concurrent register+transfer => the C++ devIdToObjKey_
+        # race is avoided. MX_OBJ_PREFETCH now means SHARDS PER BATCH, not
+        # NIXL agents (default 1 = one shard per transfer).
         import os as _os
-        depth = max(1, int(_os.environ.get("MX_OBJ_PREFETCH", "1")))
-        pool = ThreadPoolExecutor(max_workers=depth)
+        window = max(1, int(_os.environ.get("MX_OBJ_PREFETCH", "1")))
         try:
-            futures = {}
-            nxt = 0
-            while nxt < min(depth, total):
-                futures[nxt] = pool.submit(self._load_object_tensors, *shard_jobs[nxt])
-                nxt += 1
-            for i in range(total):
-                loaded = futures.pop(i).result()
-                if pbar is not None:
-                    pbar.update(1)
-                if nxt < total:
-                    futures[nxt] = pool.submit(self._load_object_tensors, *shard_jobs[nxt])
-                    nxt += 1
-                for name, tensor in loaded.items():
+            for start in range(0, total, window):
+                batch = shard_jobs[start:start + window]
+                for name, tensor in self._load_object_window(batch, device):
                     yield name, tensor
-            logger.info("OBJ load complete in %.2fs (prefetch=%d)", time.perf_counter() - load_start, depth)
+                if pbar is not None:
+                    pbar.update(len(batch))
+            logger.info(
+                "OBJ load complete in %.2fs (window=%d)",
+                time.perf_counter() - load_start, window,
+            )
         finally:
             if pbar is not None:
                 pbar.close()
-            pool.shutdown(wait=True)
-            for _mgr in self._worker_mgrs:
-                try:
-                    _mgr.shutdown()
-                except Exception:
-                    pass
-            self._worker_mgrs = []
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -253,42 +228,49 @@ class MxObjLoader:
 
         return parse_safetensors_header(read_fn)
 
-    def _load_object_tensors(
+    def _load_object_window(
         self,
-        object_key: str,
-        tensor_infos: dict[str, dict],
-    ) -> dict[str, torch.Tensor]:
-        """Load all tensors of one shard object via a single OBJ batch transfer."""
-        device = torch.device("cuda", self._device_id)
+        batch: list[tuple[str, dict[str, dict]]],
+        device: torch.device,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Load a window of shards via ONE single-agent batched OBJ transfer.
 
-        sorted_names = sorted(
-            tensor_infos.keys(),
-            key=lambda n: tensor_infos[n]["offset"],
-        )
+        Builds one job per shard (its tensor byte-ranges), registers the whole
+        window up-front and submits it as a single batched NIXL transfer, then
+        maps each shard's raw buffers back to named tensors and yields them.
+        """
+        jobs: list[tuple[str, list[tuple[int, int]]]] = []
+        per_shard_meta: list[list[tuple]] = []
+        for object_key, tensor_infos in batch:
+            sorted_names = sorted(
+                tensor_infos.keys(),
+                key=lambda n: tensor_infos[n]["offset"],
+            )
+            range_list = []
+            tensor_meta = []
+            for name in sorted_names:
+                info = tensor_infos[name]
+                st_dtype = info["dtype"]
+                torch_dtype = SAFETENSORS_DTYPE_MAP.get(st_dtype)
+                if torch_dtype is None:
+                    raise RuntimeError(
+                        f"Unsupported safetensors dtype '{st_dtype}' for tensor '{name}'"
+                    )
+                range_list.append((info["offset"], info["size"]))
+                tensor_meta.append((name, torch_dtype, info["shape"]))
+            jobs.append((object_key, range_list))
+            per_shard_meta.append(tensor_meta)
 
-        range_list = []
-        tensor_meta = []
-        for name in sorted_names:
-            info = tensor_infos[name]
-            st_dtype = info["dtype"]
-            torch_dtype = SAFETENSORS_DTYPE_MAP.get(st_dtype)
-            if torch_dtype is None:
-                raise RuntimeError(
-                    f"Unsupported safetensors dtype '{st_dtype}' for tensor '{name}'"
-                )
-            range_list.append((info["offset"], info["size"]))
-            tensor_meta.append((name, torch_dtype, info["shape"]))
+        buffers_per_shard = self._obj_manager.batch_load_objects(jobs, device)
 
-        raw_tensors = self._worker_manager().batch_load_object(
-            object_key, range_list, device,
-        )
-
-        result: dict[str, torch.Tensor] = {}
-        for raw, (name, torch_dtype, shape) in zip(raw_tensors, tensor_meta, strict=True):
-            result[name] = raw.view(torch_dtype).reshape(shape)
-
-        logger.info("Loaded object %s", object_key)
-        return result
+        for (object_key, _), tensor_meta, raw_tensors in zip(
+            batch, per_shard_meta, buffers_per_shard, strict=True
+        ):
+            for raw, (name, torch_dtype, shape) in zip(
+                raw_tensors, tensor_meta, strict=True
+            ):
+                yield name, raw.view(torch_dtype).reshape(shape)
+            logger.info("Loaded object %s", object_key)
 
     def shutdown(self) -> None:
         """Release OBJ resources."""

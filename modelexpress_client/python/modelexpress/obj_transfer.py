@@ -258,6 +258,110 @@ class ObjTransferManager:
 
         return result_buffers
 
+    def batch_load_objects(
+        self,
+        jobs: list[tuple[str, list[tuple[int, int]]]],
+        device: torch.device,
+    ) -> list[list[torch.Tensor]]:
+        """Load byte ranges from MULTIPLE objects in a single batched transfer.
+
+        Generalizes ``batch_load_object`` across a window of shards. All
+        ranges of all jobs are registered up-front and submitted as ONE NIXL
+        transfer, so a single agent drives every shard's HTTP+RDMA GETs
+        concurrently onto the shared curl-multi poller. Each OBJ descriptor
+        carries ITS OWN object key (per-descriptor meta), so shards do not
+        need separate agents.
+
+        Because every (job, range) buffer is pre-allocated and each chunk
+        descriptor points directly into its target buffer's memory, the
+        per-job demux is implicit: result_buffers[job_idx][range_idx] is the
+        buffer that range's bytes were written into.
+
+        Args:
+            jobs: list of (object_key, [(object_offset, size), ...]).
+            device: Target CUDA device.
+
+        Returns:
+            List (per job) of lists of uint8 GPU tensors, each inner list in
+            the same order as that job's range_list.
+        """
+        if self._agent is None:
+            raise RuntimeError("OBJ agent not initialized")
+
+        max_chunk = self._max_chunk_size
+
+        result_buffers: list[list[torch.Tensor]] = []
+        obj_regions = []
+        vram_regions = []
+
+        # The OBJ backend resolves each descriptor's object key by its devId
+        # (registerMem stores devIdToObjKey_[devId]=key; prepXfer looks the key
+        # up by the remote descriptor's devId). To span multiple objects in ONE
+        # transfer, every object must therefore get a DISTINCT devId -- reusing
+        # devId 0 collides every key onto one map slot (last-write-wins + a
+        # double-free on teardown). The job index is that per-object devId; all
+        # chunks of one object share it. For a single object (W=1) this is
+        # devId 0, identical to batch_load_object.
+        for job_idx, (object_key, range_list) in enumerate(jobs):
+            job_bufs: list[torch.Tensor] = []
+            for obj_offset, size in range_list:
+                buf = torch.empty(size, dtype=torch.uint8, device=device)
+                job_bufs.append(buf)
+                gpu_base = buf.data_ptr()
+
+                loaded = 0
+                while loaded < size:
+                    chunk = min(size - loaded, max_chunk)
+                    # OBJ descriptor: (offset_in_object, size, devId, object_key).
+                    obj_regions.append((obj_offset + loaded, chunk, job_idx, object_key))
+                    vram_regions.append((gpu_base + loaded, chunk, self._device_id, ""))
+                    loaded += chunk
+            result_buffers.append(job_bufs)
+
+        obj_descs = self._agent.register_memory(obj_regions, "OBJ")
+        vram_descs = self._agent.register_memory(vram_regions, "VRAM")
+
+        handle = self._agent.initialize_xfer(
+            "READ", vram_descs.trim(), obj_descs.trim(), self._agent.name
+        )
+
+        state = self._agent.transfer(handle)
+        if state == "ERR":
+            self._agent.release_xfer_handle(handle)
+            self._free_nixl_memory(obj_descs, vram_descs)
+            raise RuntimeError(
+                f"OBJ batch transfer failed for {len(jobs)} objects"
+            )
+
+        timeout = float(os.environ.get("MX_OBJ_TIMEOUT", "300"))
+        t0 = time.perf_counter()
+        spins = 0
+        while True:
+            state = self._agent.check_xfer_state(handle)
+            if state == "DONE":
+                break
+            if state == "ERR":
+                self._agent.release_xfer_handle(handle)
+                self._free_nixl_memory(obj_descs, vram_descs)
+                raise RuntimeError(
+                    f"OBJ batch transfer error for {len(jobs)} objects"
+                )
+            if time.perf_counter() - t0 > timeout:
+                self._agent.release_xfer_handle(handle)
+                self._free_nixl_memory(obj_descs, vram_descs)
+                raise TimeoutError(
+                    f"OBJ batch transfer timeout for {len(jobs)} objects"
+                )
+            spins += 1
+            if spins > 100:
+                time.sleep(0.0001)
+                spins = 0
+
+        self._agent.release_xfer_handle(handle)
+        self._free_nixl_memory(obj_descs, vram_descs)
+
+        return result_buffers
+
     def read_object_range(
         self,
         object_key: str,
