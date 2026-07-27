@@ -23,8 +23,13 @@ Environment variables:
                    GPU-direct accelerated engine,
                    '{"accelerated":"true","type":"<engine>",
                      "endpoint_override":"http://host:port"}'.
-    MX_OBJ_MAX_CHUNK_KB: Maximum chunk size in KB (default: 131072 = 128 MB)
     MX_OBJ_TIMEOUT: Transfer timeout in seconds (default: 300)
+
+Request size, concurrency and NIC selection are the backend's concern, not ours:
+each byte range is handed down as one descriptor and the OBJ backend cuts it into
+requests (``split_size``) and bounds how many run at once (``max_inflight``). We
+set neither -- ``MX_OBJ_PARAMS`` is forwarded verbatim, so an unset key keeps the
+backend's own default rather than one chosen here.
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -43,16 +49,18 @@ logger = logging.getLogger("modelexpress.obj_transfer")
 NIXL_AVAILABLE = False
 NixlAgent = None
 NixlAgentConfig = None
+NixlThreadSync = None
 try:
     from nixl._api import nixl_agent as NixlAgent
     from nixl._api import nixl_agent_config as NixlAgentConfig
+    from nixl._api import nixl_thread_sync_t as NixlThreadSync
     NIXL_AVAILABLE = True
 except ImportError:
     pass
 
-# cuObject caps a single memory registration at 4 GiB; keep chunks below it.
+# cuObject caps a single memory registration at 4 GiB. This is a hard backend
+# limit, not a tuning knob: ranges above it are split purely to stay registrable.
 _CUOBJ_MAX_REG_SIZE = 4 * 1024 * 1024 * 1024
-_DEFAULT_MAX_CHUNK = 128 * 1024 * 1024  # 128 MB
 _OBJ_BACKEND = "OBJ"
 
 # Backend parameter keys that must never be logged.
@@ -113,6 +121,25 @@ def is_obj_available() -> bool:
     return True
 
 
+@dataclass
+class ObjBatchHandle:
+    """A posted-but-not-yet-awaited OBJ batch transfer.
+
+    Holds the destination buffers plus the NIXL state that must be released
+    once the transfer completes. Produced by ``submit_objects``, consumed by
+    ``wait_objects``; a handle must be awaited exactly once, since awaiting
+    deregisters its memory.
+    """
+
+    buffers: list[list[torch.Tensor]]
+    label: str
+    descriptors: int
+    posted_at: float
+    xfer: Any
+    obj_descs: Any
+    vram_descs: Any
+
+
 class ObjTransferManager:
     """
     Manages a NIXL OBJ backend for object-to-GPU transfers.
@@ -134,9 +161,8 @@ class ObjTransferManager:
         self._params = params if params is not None else obj_backend_params()
         self._device_id: int | None = None
         self._agent: Any = None
-        override = os.environ.get("MX_OBJ_MAX_CHUNK_KB")
-        chunk = int(override) * 1024 if override else _DEFAULT_MAX_CHUNK
-        self._max_chunk_size = min(chunk, _CUOBJ_MAX_REG_SIZE)
+        # Monotonic OBJ devId source; see submit_objects for why it must not reset.
+        self._next_obj_dev_id = 0
 
     def __enter__(self) -> ObjTransferManager:
         self.initialize()
@@ -163,14 +189,21 @@ class ObjTransferManager:
 
         # Create the agent without auto-initializing UCX; the OBJ backend
         # needs custom params and is created explicitly below.
-        config = NixlAgentConfig(backends=[])
+        #
+        # sync_mode is explicit: NIXL's default resolves to THREAD_SYNC_NONE when
+        # the listener thread is off, which compiles the agent's locks down to
+        # no-ops and leaves the OBJ engine's devId->objKey map unguarded. RW takes
+        # the writer lock in registerMem and a reader lock on the prepXfer path.
+        config = NixlAgentConfig(
+            backends=[],
+            sync_mode=NixlThreadSync.NIXL_THREAD_SYNC_RW,
+        )
         self._agent = NixlAgent(self._agent_name, config)
         self._agent.create_backend(_OBJ_BACKEND, self._params)
 
         logger.info(
-            "OBJ agent '%s' created on device %d (params=%s, max_chunk=%dMB)",
+            "OBJ agent '%s' created on device %d (params=%s)",
             self._agent_name, self._device_id, _redact(self._params),
-            self._max_chunk_size // (1024 * 1024),
         )
 
     def batch_load_object(
@@ -181,8 +214,8 @@ class ObjTransferManager:
     ) -> list[torch.Tensor]:
         """Load multiple byte ranges of one object in a single batch transfer.
 
-        All ranges are submitted at once so the backend drives them in
-        parallel. Large ranges are split into chunks of max_chunk_size.
+        All ranges are submitted at once and the backend decides how to cut and
+        schedule them; one range here may become several requests on the wire.
 
         Args:
             object_key: Object key relative to the OBJ backend's bucket/endpoint.
@@ -194,69 +227,7 @@ class ObjTransferManager:
         """
         if self._agent is None:
             raise RuntimeError("OBJ agent not initialized")
-
-        max_chunk = self._max_chunk_size
-
-        result_buffers = []
-        obj_regions = []
-        vram_regions = []
-
-        for obj_offset, size in range_list:
-            buf = torch.empty(size, dtype=torch.uint8, device=device)
-            result_buffers.append(buf)
-            gpu_base = buf.data_ptr()
-
-            loaded = 0
-            while loaded < size:
-                chunk = min(size - loaded, max_chunk)
-                # OBJ descriptor: (offset_in_object, size, devId, object_key).
-                # The backend uses the addr field as the read offset and the
-                # meta-info string as the object key.
-                obj_regions.append((obj_offset + loaded, chunk, 0, object_key))
-                vram_regions.append((gpu_base + loaded, chunk, self._device_id, ""))
-                loaded += chunk
-
-        obj_descs = self._agent.register_memory(obj_regions, "OBJ")
-        vram_descs = self._agent.register_memory(vram_regions, "VRAM")
-
-        handle = self._agent.initialize_xfer(
-            "READ", vram_descs.trim(), obj_descs.trim(), self._agent.name
-        )
-
-        state = self._agent.transfer(handle)
-        if state == "ERR":
-            self._agent.release_xfer_handle(handle)
-            self._free_nixl_memory(obj_descs, vram_descs)
-            raise RuntimeError(f"OBJ batch transfer failed for key '{object_key}'")
-
-        timeout = float(os.environ.get("MX_OBJ_TIMEOUT", "300"))
-        t0 = time.perf_counter()
-        spins = 0
-        while True:
-            state = self._agent.check_xfer_state(handle)
-            if state == "DONE":
-                break
-            if state == "ERR":
-                self._agent.release_xfer_handle(handle)
-                self._free_nixl_memory(obj_descs, vram_descs)
-                raise RuntimeError(
-                    f"OBJ batch transfer error for key '{object_key}'"
-                )
-            if time.perf_counter() - t0 > timeout:
-                self._agent.release_xfer_handle(handle)
-                self._free_nixl_memory(obj_descs, vram_descs)
-                raise TimeoutError(
-                    f"OBJ batch transfer timeout for key '{object_key}'"
-                )
-            spins += 1
-            if spins > 100:
-                time.sleep(0.0001)
-                spins = 0
-
-        self._agent.release_xfer_handle(handle)
-        self._free_nixl_memory(obj_descs, vram_descs)
-
-        return result_buffers
+        return self.batch_load_objects([(object_key, range_list)], device)[0]
 
     def batch_load_objects(
         self,
@@ -285,10 +256,26 @@ class ObjTransferManager:
             List (per job) of lists of uint8 GPU tensors, each inner list in
             the same order as that job's range_list.
         """
+        return self.wait_objects(self.submit_objects(jobs, device))
+
+    def submit_objects(
+        self,
+        jobs: list[tuple[str, list[tuple[int, int]]]],
+        device: torch.device,
+    ) -> ObjBatchHandle:
+        """Register and post a multi-object batch without waiting for it.
+
+        Allocates the destination buffers, registers every range, and posts one
+        NIXL transfer, then returns immediately. Pair with ``wait_objects``.
+        Submitting a second batch before awaiting the first is supported and is
+        how the loader keeps the fabric busy across window boundaries.
+
+        Args:
+            jobs: list of (object_key, [(object_offset, size), ...]).
+            device: Target CUDA device.
+        """
         if self._agent is None:
             raise RuntimeError("OBJ agent not initialized")
-
-        max_chunk = self._max_chunk_size
 
         result_buffers: list[list[torch.Tensor]] = []
         obj_regions = []
@@ -296,13 +283,27 @@ class ObjTransferManager:
 
         # The OBJ backend resolves each descriptor's object key by its devId
         # (registerMem stores devIdToObjKey_[devId]=key; prepXfer looks the key
-        # up by the remote descriptor's devId). To span multiple objects in ONE
-        # transfer, every object must therefore get a DISTINCT devId -- reusing
-        # devId 0 collides every key onto one map slot (last-write-wins + a
-        # double-free on teardown). The job index is that per-object devId; all
-        # chunks of one object share it. For a single object (W=1) this is
-        # devId 0, identical to batch_load_object.
-        for job_idx, (object_key, range_list) in enumerate(jobs):
+        # up by the remote descriptor's devId). Every object must therefore get a
+        # DISTINCT devId -- reusing one collides every key onto a single map slot
+        # (last-write-wins, plus a double-free on teardown).
+        #
+        # The devId comes from a monotonic per-manager counter rather than the
+        # index within this batch: with two batches in flight, per-batch indices
+        # would alias, and deregistering the older batch would erase the newer
+        # batch's map entries. A counter keeps every live registration distinct.
+        #
+        # Only the OBJ side's devId is free to be an index. On the VRAM side devId
+        # must stay the real GPU ordinal: the backend uses it for the CUDA device
+        # guard and to pick a PCIe-affine NIC per registration.
+        #
+        # Each range is one descriptor, whatever its size. The backend cuts it into
+        # requests of at most its own split_size and decides which NIC each rides,
+        # so request size and rail spread are not ours to choose. The only split
+        # here is the cuObject registration ceiling, which is a hard limit rather
+        # than a tuning knob.
+        for object_key, range_list in jobs:
+            obj_dev_id = self._next_obj_dev_id
+            self._next_obj_dev_id += 1
             job_bufs: list[torch.Tensor] = []
             for obj_offset, size in range_list:
                 buf = torch.empty(size, dtype=torch.uint8, device=device)
@@ -310,57 +311,76 @@ class ObjTransferManager:
                 gpu_base = buf.data_ptr()
 
                 loaded = 0
-                while loaded < size:
-                    chunk = min(size - loaded, max_chunk)
+                while True:
+                    span = min(size - loaded, _CUOBJ_MAX_REG_SIZE)
                     # OBJ descriptor: (offset_in_object, size, devId, object_key).
-                    obj_regions.append((obj_offset + loaded, chunk, job_idx, object_key))
-                    vram_regions.append((gpu_base + loaded, chunk, self._device_id, ""))
-                    loaded += chunk
+                    obj_regions.append((obj_offset + loaded, span, obj_dev_id, object_key))
+                    vram_regions.append((gpu_base + loaded, span, self._device_id, ""))
+                    loaded += span
+                    if loaded >= size:
+                        break
             result_buffers.append(job_bufs)
+
+        label = (
+            f"key '{jobs[0][0]}'" if len(jobs) == 1 else f"{len(jobs)} objects"
+        )
 
         obj_descs = self._agent.register_memory(obj_regions, "OBJ")
         vram_descs = self._agent.register_memory(vram_regions, "VRAM")
 
-        handle = self._agent.initialize_xfer(
+        xfer = self._agent.initialize_xfer(
             "READ", vram_descs.trim(), obj_descs.trim(), self._agent.name
         )
 
-        state = self._agent.transfer(handle)
+        state = self._agent.transfer(xfer)
         if state == "ERR":
-            self._agent.release_xfer_handle(handle)
+            self._agent.release_xfer_handle(xfer)
             self._free_nixl_memory(obj_descs, vram_descs)
-            raise RuntimeError(
-                f"OBJ batch transfer failed for {len(jobs)} objects"
-            )
+            raise RuntimeError(f"OBJ batch transfer failed for {label}")
+
+        return ObjBatchHandle(
+            buffers=result_buffers,
+            label=label,
+            descriptors=len(obj_regions),
+            posted_at=time.perf_counter(),
+            xfer=xfer,
+            obj_descs=obj_descs,
+            vram_descs=vram_descs,
+        )
+
+    def wait_objects(self, handle: ObjBatchHandle) -> list[list[torch.Tensor]]:
+        """Wait for a submitted batch, release its NIXL state, return buffers.
+
+        The timeout runs from the batch's post time, not from entry here, so a
+        batch that was queued behind another is not given extra grace.
+        """
+        if self._agent is None:
+            raise RuntimeError("OBJ agent not initialized")
 
         timeout = float(os.environ.get("MX_OBJ_TIMEOUT", "300"))
-        t0 = time.perf_counter()
         spins = 0
-        while True:
-            state = self._agent.check_xfer_state(handle)
-            if state == "DONE":
-                break
-            if state == "ERR":
-                self._agent.release_xfer_handle(handle)
-                self._free_nixl_memory(obj_descs, vram_descs)
-                raise RuntimeError(
-                    f"OBJ batch transfer error for {len(jobs)} objects"
-                )
-            if time.perf_counter() - t0 > timeout:
-                self._agent.release_xfer_handle(handle)
-                self._free_nixl_memory(obj_descs, vram_descs)
-                raise TimeoutError(
-                    f"OBJ batch transfer timeout for {len(jobs)} objects"
-                )
-            spins += 1
-            if spins > 100:
-                time.sleep(0.0001)
-                spins = 0
+        try:
+            while True:
+                state = self._agent.check_xfer_state(handle.xfer)
+                if state == "DONE":
+                    break
+                if state == "ERR":
+                    raise RuntimeError(
+                        f"OBJ batch transfer error for {handle.label}"
+                    )
+                if time.perf_counter() - handle.posted_at > timeout:
+                    raise TimeoutError(
+                        f"OBJ batch transfer timeout for {handle.label}"
+                    )
+                spins += 1
+                if spins > 100:
+                    time.sleep(0.0001)
+                    spins = 0
+        finally:
+            self._agent.release_xfer_handle(handle.xfer)
+            self._free_nixl_memory(handle.obj_descs, handle.vram_descs)
 
-        self._agent.release_xfer_handle(handle)
-        self._free_nixl_memory(obj_descs, vram_descs)
-
-        return result_buffers
+        return handle.buffers
 
     def read_object_range(
         self,

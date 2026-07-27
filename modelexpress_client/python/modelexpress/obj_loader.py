@@ -25,21 +25,84 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 import uuid
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, NamedTuple
 
 import torch
 
-from .obj_transfer import ObjTransferManager, is_obj_available
-from .safetensors_meta import SAFETENSORS_DTYPE_MAP, parse_safetensors_header
+from .obj_transfer import ObjBatchHandle, ObjTransferManager, is_obj_available
+from .safetensors_meta import (
+    HEADER_LEN_SIZE,
+    SAFETENSORS_DTYPE_MAP,
+    parse_header_json,
+    parse_header_size,
+)
 
 logger = logging.getLogger("modelexpress.obj_loader")
 
 # Leading "<scheme>://" on an object URI, stripped to get the key prefix.
 _URI_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+# Target bytes per transfer. Tensors are coalesced up to this, which sets the
+# descriptor size the backend sees and therefore how it cuts and schedules the
+# request stream. Measured optimum for an accelerated engine on 1x100G is a few
+# tens of MB per descriptor; it also keeps per-descriptor submission work off the
+# critical path on models with very many small tensors (MoE experts, fp8 scales),
+# where one transfer per tensor would mean tens of thousands of them.
+_DEFAULT_GROUP_BYTES = 64 * 1024 * 1024
+
+# Descriptors the staging budget aims to keep outstanding. The budget is derived
+# from what keeps the backend fed rather than from what VRAM happens to be free:
+# past saturation, extra staging buys nothing and takes memory from the engine.
+_STAGING_DESCRIPTORS = 8
+
+# Floor for the staging budget, so small-descriptor models still queue enough
+# work to cover request latency.
+_MIN_STAGING_BYTES = 2 * 1024 * 1024 * 1024
+
+# Hard ceiling on the staging budget as a share of currently-free VRAM, so a
+# model with very large tensors cannot budget itself into an OOM.
+_STAGING_VRAM_CEILING = 0.5
+
+
+class _PlannedTensor(NamedTuple):
+    """One tensor within a group: where it sits in the group's buffer."""
+
+    name: str
+    dtype: torch.dtype
+    shape: list[int]
+    rel_offset: int
+    size: int
+
+
+class _PlannedGroup(NamedTuple):
+    """One contiguous byte range to fetch, covering one or more tensors.
+
+    The group is the unit of transfer, so its size is what the backend sees and
+    what the staging budget accounts for. The shard survives only as
+    ``object_key``; nothing downstream groups by it.
+    """
+
+    object_key: str
+    offset: int
+    size: int
+    members: list[_PlannedTensor]
+
+
+def _element_size(dtype: torch.dtype) -> int:
+    """Bytes per element, cached: needed for the view() alignment check."""
+    size = _ELEMENT_SIZES.get(dtype)
+    if size is None:
+        size = torch.empty(0, dtype=dtype).element_size()
+        _ELEMENT_SIZES[dtype] = size
+    return size
+
+
+_ELEMENT_SIZES: dict[torch.dtype, int] = {}
 
 
 class MxObjLoader:
@@ -99,47 +162,76 @@ class MxObjLoader:
 
         device = torch.device("cuda", self._device_id)
 
-        shard_jobs = []
-        for basename in shard_basenames:
-            object_key = self._object_key(prefix, basename)
-            tensor_infos = self._parse_object_header(object_key, device)
-            if tensor_infos:
-                shard_jobs.append((object_key, tensor_infos))
-
-        if not shard_jobs:
+        plan = self._build_plan(prefix, shard_basenames, device)
+        if not plan:
             return
 
-        total = len(shard_jobs)
+        budget = self._resolve_staging_budget(max(g.size for g in plan))
+        ntensors = sum(len(g.members) for g in plan)
+
         pbar = None
         if use_tqdm:
             from tqdm import tqdm
             pbar = tqdm(
-                total=total,
+                total=ntensors,
                 desc="Loading safetensors via OBJ",
-                unit="shard",
+                unit="tensor",
             )
 
-        # Single-agent windowed multi-shard batch: register a window of W
-        # shards up-front and submit them as ONE batched NIXL transfer on the
-        # SAME singleton agent used for header reads, then yield tensors in any
-        # order (vLLM load_weights is name-matched / order-agnostic). One
-        # thread => no concurrent register+transfer => the C++ devIdToObjKey_
-        # race is avoided. MX_OBJ_PREFETCH now means SHARDS PER BATCH, not
-        # NIXL agents (default 1 = one shard per transfer).
-        import os as _os
-        window = max(1, int(_os.environ.get("MX_OBJ_PREFETCH", "1")))
+        # One transfer per group, posted as fast as the staging budget allows.
+        #
+        # The transfer handle is the unit of completion -- NIXL reports DONE only
+        # once every request in a handle has landed, with no per-request status --
+        # so the group is also the delivery granularity: its tensors become
+        # available together, which is why groups are kept to tens of MB.
+        #
+        # Concurrency is not managed here. The backend cuts each descriptor into
+        # requests and caps how many run at once, so posting generously just keeps
+        # its queue fed; all this loop bounds is VRAM committed to groups that have
+        # been requested but not yet consumed.
+        #
+        # Entries are popped before being drained, so a failure mid-drain cannot
+        # double-await one; whatever is still queued is drained by the finally.
+        inflight: list[tuple[ObjBatchHandle, _PlannedGroup]] = []
+        staged = 0
         try:
-            for start in range(0, total, window):
-                batch = shard_jobs[start:start + window]
-                for name, tensor in self._load_object_window(batch, device):
-                    yield name, tensor
+            for group in plan:
+                # Make room first, but always admit one group so an oversized one
+                # cannot deadlock against its own budget.
+                while inflight and staged + group.size > budget:
+                    handle, done = inflight.pop(0)
+                    staged -= done.size
+                    yield from self._take(handle, done)
+                    if pbar is not None:
+                        pbar.update(len(done.members))
+
+                handle = self._obj_manager.submit_objects(
+                    [(group.object_key, [(group.offset, group.size)])], device
+                )
+                inflight.append((handle, group))
+                staged += group.size
+
+            while inflight:
+                handle, done = inflight.pop(0)
+                staged -= done.size
+                yield from self._take(handle, done)
                 if pbar is not None:
-                    pbar.update(len(batch))
+                    pbar.update(len(done.members))
+
             logger.info(
-                "OBJ load complete in %.2fs (window=%d)",
-                time.perf_counter() - load_start, window,
+                "OBJ load complete in %.2fs (%d tensors in %d transfers)",
+                time.perf_counter() - load_start, ntensors, len(plan),
             )
         finally:
+            # A consumer that abandons the iterator (or an error mid-yield) can
+            # leave posted transfers unawaited. Their memory is still registered
+            # and the server may still be writing into it, so they must be awaited
+            # rather than simply dropped.
+            for pending, _group in inflight:
+                try:
+                    self._obj_manager.wait_objects(pending)
+                except Exception as e:
+                    logger.warning("Abandoned OBJ transfer failed to drain: %s", e)
             if pbar is not None:
                 pbar.close()
 
@@ -157,6 +249,53 @@ class MxObjLoader:
     def _object_key(prefix: str, basename: str) -> str:
         """Join the key prefix and a shard basename into an object key."""
         return f"{prefix}/{basename}" if prefix else basename
+
+    def _resolve_staging_budget(self, largest_group: int) -> int:
+        """Bytes of staging buffers allowed outstanding at once.
+
+        Sized by what keeps the backend fed -- a handful of descriptors in flight
+        -- not by what VRAM is free. Past saturation extra staging buys no
+        throughput and simply takes memory the engine needs, so a machine with
+        60 GiB spare should not stage 15 GiB to keep 512 MB on the wire.
+
+        Clamped to a share of free VRAM so a model with very large tensors cannot
+        budget itself into an OOM. A single group larger than the budget is still
+        admitted by the feed loop, since refusing it would stall the load.
+        """
+        override = os.environ.get("MX_OBJ_STAGING_MB")
+        free, _total = torch.cuda.mem_get_info(self._device_id)
+        # The caching allocator's unused reserve is available to us too.
+        cached = torch.cuda.memory_reserved(
+            self._device_id
+        ) - torch.cuda.memory_allocated(self._device_id)
+        available = free + cached
+
+        if override:
+            budget = int(override) * 1024 * 1024
+            source = "MX_OBJ_STAGING_MB"
+        else:
+            budget = max(_MIN_STAGING_BYTES, _STAGING_DESCRIPTORS * largest_group)
+            source = f"auto, {_STAGING_DESCRIPTORS} descriptors"
+
+        ceiling = int(available * _STAGING_VRAM_CEILING)
+        if budget > ceiling:
+            logger.warning(
+                "OBJ staging budget %.1f GiB exceeds %.0f%% of free VRAM "
+                "(%.1f GiB free); clamping to %.1f GiB, which may leave the "
+                "backend idle between transfers",
+                budget / (1024 ** 3), 100 * _STAGING_VRAM_CEILING,
+                available / (1024 ** 3), ceiling / (1024 ** 3),
+            )
+            budget = max(ceiling, largest_group)
+            source += ", VRAM-clamped"
+
+        logger.info(
+            "OBJ staging budget %.1f GiB (%s); largest descriptor %.1f MiB, "
+            "%.1f GiB free",
+            budget / (1024 ** 3), source, largest_group / (1024 ** 2),
+            available / (1024 ** 3),
+        )
+        return budget
 
     def _ensure_obj_manager(self) -> None:
         """Lazily create and initialize the OBJ transfer manager."""
@@ -217,38 +356,100 @@ class MxObjLoader:
             "Object-store loading requires the shard layout to be resolvable."
         )
 
-    def _parse_object_header(
-        self, object_key: str, device: torch.device
-    ) -> dict[str, dict]:
-        """Parse a shard object's safetensors header via ranged RDMA GETs."""
-        def read_fn(offset: int, length: int) -> bytes:
-            return self._obj_manager.read_object_range(
-                object_key, offset, length, device
-            )
+    def _parse_object_headers(
+        self, object_keys: list[str], device: torch.device
+    ) -> dict[str, dict[str, dict]]:
+        """Parse every shard's safetensors header in two batched round trips.
 
-        return parse_safetensors_header(read_fn)
-
-    def _load_object_window(
-        self,
-        batch: list[tuple[str, dict[str, dict]]],
-        device: torch.device,
-    ) -> Iterator[tuple[str, torch.Tensor]]:
-        """Load a window of shards via ONE single-agent batched OBJ transfer.
-
-        Builds one job per shard (its tensor byte-ranges), registers the whole
-        window up-front and submits it as a single batched NIXL transfer, then
-        maps each shard's raw buffers back to named tensors and yields them.
+        A safetensors header needs two reads -- a u64 length, then that many bytes
+        of JSON -- and they are inherently sequential. Done per shard that is
+        2 * N sequential round trips before the first weight byte can move, which
+        on a many-shard model is the single longest serial stretch of the load.
+        Batching across shards makes it 2 regardless of shard count.
         """
-        jobs: list[tuple[str, list[tuple[int, int]]]] = []
-        per_shard_meta: list[list[tuple]] = []
-        for object_key, tensor_infos in batch:
-            sorted_names = sorted(
-                tensor_infos.keys(),
-                key=lambda n: tensor_infos[n]["offset"],
-            )
-            range_list = []
-            tensor_meta = []
-            for name in sorted_names:
+        if not object_keys:
+            return {}
+
+        sizes = self._obj_manager.batch_load_objects(
+            [(key, [(0, HEADER_LEN_SIZE)]) for key in object_keys], device
+        )
+        header_sizes = [
+            parse_header_size(bytes(bufs[0].cpu().numpy())) for bufs in sizes
+        ]
+
+        blobs = self._obj_manager.batch_load_objects(
+            [
+                (key, [(HEADER_LEN_SIZE, size)])
+                for key, size in zip(object_keys, header_sizes, strict=True)
+            ],
+            device,
+        )
+        return {
+            key: parse_header_json(bytes(bufs[0].cpu().numpy()))
+            for key, bufs in zip(object_keys, blobs, strict=True)
+        }
+
+    def _build_plan(
+        self,
+        prefix: str,
+        shard_basenames: list[str],
+        device: torch.device,
+    ) -> list[_PlannedGroup]:
+        """Flatten every shard's header into an ordered list of groups to fetch.
+
+        Tensors are walked in (shard, offset) order and coalesced into contiguous
+        groups of about MX_OBJ_GROUP_MB, so the request stream walks each object
+        forwards and one descriptor covers several tensors. Consumption order does
+        not have to match: the engine matches tensors by name.
+
+        A group breaks whenever the next tensor would not extend it cleanly:
+
+        - a different object, or a gap in the byte range, since a descriptor is
+          one contiguous range of one object;
+        - the target size would be exceeded;
+        - the tensor would land at a relative offset its dtype cannot be viewed
+          at. Slicing the group buffer and calling ``view(dtype)`` needs the
+          offset to be a multiple of the element size, and safetensors gives no
+          alignment guarantee, so misalignment starts a fresh group rather than
+          forcing a copy.
+
+        A tensor is never split across groups, so a tensor larger than the target
+        simply gets a group of its own.
+        """
+        object_keys = [self._object_key(prefix, b) for b in shard_basenames]
+        headers = self._parse_object_headers(object_keys, device)
+
+        override = os.environ.get("MX_OBJ_GROUP_MB")
+        target = (
+            max(1, int(override) * 1024 * 1024) if override else _DEFAULT_GROUP_BYTES
+        )
+
+        groups: list[_PlannedGroup] = []
+        members: list[_PlannedTensor] = []
+        cur_key: str | None = None
+        cur_offset = 0
+        cur_size = 0
+        ntensors = 0
+
+        def flush() -> None:
+            nonlocal members, cur_size
+            if members:
+                groups.append(
+                    _PlannedGroup(
+                        object_key=cur_key,
+                        offset=cur_offset,
+                        size=cur_size,
+                        members=members,
+                    )
+                )
+                members = []
+                cur_size = 0
+
+        for object_key in object_keys:
+            tensor_infos = headers[object_key]
+            for name in sorted(
+                tensor_infos.keys(), key=lambda n: tensor_infos[n]["offset"]
+            ):
                 info = tensor_infos[name]
                 st_dtype = info["dtype"]
                 torch_dtype = SAFETENSORS_DTYPE_MAP.get(st_dtype)
@@ -256,21 +457,59 @@ class MxObjLoader:
                     raise RuntimeError(
                         f"Unsupported safetensors dtype '{st_dtype}' for tensor '{name}'"
                     )
-                range_list.append((info["offset"], info["size"]))
-                tensor_meta.append((name, torch_dtype, info["shape"]))
-            jobs.append((object_key, range_list))
-            per_shard_meta.append(tensor_meta)
+                offset, size = info["offset"], info["size"]
+                ntensors += 1
 
-        buffers_per_shard = self._obj_manager.batch_load_objects(jobs, device)
+                extends = (
+                    members
+                    and object_key == cur_key
+                    and cur_offset + cur_size == offset
+                    and cur_size + size <= target
+                    and cur_size % _element_size(torch_dtype) == 0
+                )
+                if not extends:
+                    flush()
+                    cur_key, cur_offset = object_key, offset
 
-        for (object_key, _), tensor_meta, raw_tensors in zip(
-            batch, per_shard_meta, buffers_per_shard, strict=True
-        ):
-            for raw, (name, torch_dtype, shape) in zip(
-                raw_tensors, tensor_meta, strict=True
-            ):
-                yield name, raw.view(torch_dtype).reshape(shape)
-            logger.info("Loaded object %s", object_key)
+                members.append(
+                    _PlannedTensor(
+                        name=name,
+                        dtype=torch_dtype,
+                        shape=info["shape"],
+                        rel_offset=cur_size,
+                        size=size,
+                    )
+                )
+                cur_size += size
+        flush()
+
+        total = sum(g.size for g in groups)
+        logger.info(
+            "OBJ plan: %d tensors in %d group(s) across %d shard object(s), "
+            "%.1f GiB total, %.1f MiB mean group (target %.0f MiB)",
+            ntensors, len(groups), len(shard_basenames), total / (1024 ** 3),
+            (total / len(groups) if groups else 0) / (1024 ** 2),
+            target / (1024 ** 2),
+        )
+        return groups
+
+    def _take(
+        self, handle: ObjBatchHandle, group: _PlannedGroup
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Await one posted group and yield its tensors as named, typed views.
+
+        Every member is a slice of the one staging buffer, so no copy is made and
+        the buffer lives until the consumer has released the last view from it.
+        The manager's own reference is dropped so that is the only thing keeping
+        it alive.
+        """
+        buffers = self._obj_manager.wait_objects(handle)
+        raw = buffers[0][0]
+        handle.buffers = []
+
+        for m in group.members:
+            chunk = raw[m.rel_offset:m.rel_offset + m.size]
+            yield m.name, chunk.view(m.dtype).reshape(m.shape)
 
     def shutdown(self) -> None:
         """Release OBJ resources."""

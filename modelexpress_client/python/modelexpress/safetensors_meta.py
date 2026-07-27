@@ -39,6 +39,50 @@ SAFETENSORS_DTYPE_MAP: dict[str, torch.dtype] = {
 MAX_HEADER_SIZE = 100 * 1024 * 1024
 
 
+# A safetensors blob opens with a little-endian u64 giving the header length.
+HEADER_LEN_SIZE = 8
+
+
+def parse_header_size(raw: bytes) -> int:
+    """Decode the leading u64 header length and range-check it.
+
+    Split out from ``parse_safetensors_header`` so a caller that fetches many
+    blobs' first bytes in one batch can decode them without a second reader.
+    """
+    if len(raw) < HEADER_LEN_SIZE:
+        raise RuntimeError("Invalid safetensors blob: truncated header size")
+
+    header_size = struct.unpack("<Q", raw[:HEADER_LEN_SIZE])[0]
+    if header_size > MAX_HEADER_SIZE:
+        raise RuntimeError(f"Safetensors header too large ({header_size} bytes)")
+    return header_size
+
+
+def parse_header_json(header_bytes: bytes) -> dict[str, dict]:
+    """Turn a raw safetensors header blob into tensor metadata.
+
+    ``header_bytes`` is the JSON that follows the leading u64, i.e. exactly
+    ``parse_header_size(...)`` bytes read from offset ``HEADER_LEN_SIZE``.
+
+    Returns the same mapping as ``parse_safetensors_header``.
+    """
+    header = json.loads(header_bytes)
+    data_start = HEADER_LEN_SIZE + len(header_bytes)
+
+    result: dict[str, dict] = {}
+    for name, info in header.items():
+        if name == "__metadata__":
+            continue
+        offsets = info["data_offsets"]
+        result[name] = {
+            "offset": data_start + offsets[0],
+            "size": offsets[1] - offsets[0],
+            "dtype": info["dtype"],
+            "shape": info["shape"],
+        }
+    return result
+
+
 def parse_safetensors_header(
     read_fn: Callable[[int, int], bytes],
 ) -> dict[str, dict]:
@@ -53,26 +97,5 @@ def parse_safetensors_header(
         where ``offset`` is the absolute byte offset of the tensor data within
         the blob.
     """
-    raw = read_fn(0, 8)
-    if len(raw) < 8:
-        raise RuntimeError("Invalid safetensors blob: truncated header size")
-
-    header_size = struct.unpack("<Q", raw)[0]
-    if header_size > MAX_HEADER_SIZE:
-        raise RuntimeError(f"Safetensors header too large ({header_size} bytes)")
-
-    header = json.loads(read_fn(8, header_size))
-    data_start = 8 + header_size
-
-    result: dict[str, dict] = {}
-    for name, info in header.items():
-        if name == "__metadata__":
-            continue
-        offsets = info["data_offsets"]
-        result[name] = {
-            "offset": data_start + offsets[0],
-            "size": offsets[1] - offsets[0],
-            "dtype": info["dtype"],
-            "shape": info["shape"],
-        }
-    return result
+    header_size = parse_header_size(read_fn(0, HEADER_LEN_SIZE))
+    return parse_header_json(read_fn(HEADER_LEN_SIZE, header_size))
