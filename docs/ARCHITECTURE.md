@@ -530,9 +530,9 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
-| `obj_transfer.py` | NIXL OBJ availability check and `ObjTransferManager` for object-to-GPU transfers (engine-agnostic: S3 / S3 CRT / accelerated engines via `MX_OBJ_PARAMS`) |
-| `obj_loader.py` | `MxObjLoader` - object-store model loader (direct object-to-GPU) |
-| `safetensors_meta.py` | Source-agnostic safetensors header parsing shared by the GDS and OBJ loaders |
+| `obj_transfer.py` | NIXL OBJ availability check and `ObjTransferManager` for object-to-GPU transfers (engine-agnostic: S3 / S3 CRT / accelerated engines via `MX_OBJ_PARAMS`). `submit_objects` / `wait_objects` split posting from awaiting so transfers can overlap; `ObjBatchHandle` carries one posted transfer. Hands each byte range down as a single descriptor — request size, concurrency and NIC choice are the backend's (`split_size` / `max_inflight`) |
+| `obj_loader.py` | `MxObjLoader` - object-store model loader (direct object-to-GPU). Flattens every shard header into an offset-ordered plan, coalesces consecutive tensors into contiguous `~MX_OBJ_GROUP_MB` groups (breaking at object boundaries, byte gaps and dtype misalignment), posts one transfer per group bounded by a staging-byte budget (`MX_OBJ_STAGING_MB`), and yields each group's tensors as zero-copy slices when its transfer completes |
+| `safetensors_meta.py` | Source-agnostic safetensors header parsing shared by the GDS and OBJ loaders. `parse_safetensors_header` for the sequential (GDS) case; `parse_header_size` / `parse_header_json` let the OBJ loader batch every shard's header into two round trips |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection |

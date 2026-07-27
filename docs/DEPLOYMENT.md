@@ -402,9 +402,10 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
 | `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
 | `MX_OBJ_URI` | (unset) | Object key prefix where the model's safetensors shards live. Set to enable `ObjStrategy` — see [Object-Store (OBJ) Backend](#object-store-obj-backend). |
-| `MX_OBJ_PARAMS` | `{}` | JSON object of NIXL OBJ backend parameters, passed verbatim to the backend. Selects the engine and its connection settings (`type`, `accelerated`, `endpoint_override`, `bucket`, `region`, `crtMinLimit`, `num_threads`, credentials, ...). See the NIXL OBJ plugin README for the full vocabulary. |
-| `MX_OBJ_MAX_CHUNK_KB` | `131072` (128 MB) | Maximum chunk size for OBJ transfers; capped at the 4 GiB cuObject registration limit. |
-| `MX_OBJ_TIMEOUT` | `300` | OBJ transfer timeout in seconds. |
+| `MX_OBJ_PARAMS` | `{}` | JSON object of NIXL OBJ backend parameters, passed verbatim to the backend — ModelExpress adds nothing and overrides nothing, so any key left unset keeps the backend's own default. Selects the engine and its connection settings (`type`, `accelerated`, `endpoint_override`, `bucket`, `region`, `crtMinLimit`, `num_threads`, credentials, ...), and carries the two transfer knobs `split_size` and `max_inflight` — see [Throughput tuning](#throughput-tuning). See the NIXL OBJ plugin README for the full vocabulary. |
+| `MX_OBJ_TIMEOUT` | `300` | OBJ transfer timeout in seconds, measured from when a transfer is posted. |
+| `MX_OBJ_GROUP_MB` | `64` | Target size of one OBJ transfer. Consecutive tensors in a shard are coalesced into contiguous groups of about this size, so one descriptor covers several tensors. Sets both the descriptor size the backend sees and the delivery granularity (a group's tensors become available together). |
+| `MX_OBJ_STAGING_MB` | (auto: `max(2048, 8 x largest group)`, capped at 50% of free VRAM) | GPU memory the loader may hold in staging buffers for groups requested but not yet consumed. Bounds memory only, not request count. Derived from what keeps the backend fed rather than from free VRAM, so a mostly-idle GPU does not stage tens of GiB to no benefit. A group bigger than the budget is always admitted. |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
@@ -470,6 +471,104 @@ The shard layout (`model.safetensors.index.json` / `model.safetensors`)
 is resolved from the model metadata referenced by the engine config;
 only that small metadata is read locally, while the weight bytes are
 read from the object store.
+
+#### Throughput tuning
+
+Transport behaviour is the backend's concern, not the loader's. The
+loader hands down contiguous byte ranges and the backend decides how to
+cut them into requests, how many run at once, and which NIC each uses.
+The shard plays no part beyond being where a header is read from.
+
+That leaves four knobs in two places.
+
+**Backend, via `MX_OBJ_PARAMS`:**
+
+- `split_size` (default 16 MB, `0` disables) — bytes per request. Each
+  descriptor becomes `ceil(size / split_size)` ranged GETs. This is the
+  primary throughput control; 16 MB is the measured optimum on Scality
+  RING over 1x100G.
+- `max_inflight` (default 512, `0` disables) — requests running
+  concurrently. Requests beyond the cap wait in the connector and start
+  as slots free, so throughput is preserved while file-descriptor use
+  stays bounded. The measured optimum on Scality RING over 1x100G is
+  **64**; the 512 default is an fd guard rail rather than a tuned value,
+  so set it explicitly for that fabric.
+
+Neither knob is set by ModelExpress. `MX_OBJ_PARAMS` is forwarded
+untouched, so leaving a key out keeps the backend's default — transport
+tuning belongs to the backend, not the loader.
+
+**Loader, via two knobs:**
+
+- `MX_OBJ_GROUP_MB` (default 64) — target transfer size. Consecutive
+  tensors are coalesced into contiguous groups of about this, so the
+  descriptor size the backend sees is set here rather than by whatever
+  the model's tensors happen to be. This matters most on mixture-of-expert
+  checkpoints, where per-tensor transfers would mean tens of thousands of
+  small descriptors: DeepSeek-V3 has ~92,000 tensors averaging 7 MiB,
+  which 64 MiB grouping turns into ~11,000 transfers averaging 57 MiB.
+- `MX_OBJ_STAGING_MB` — GPU memory held in staging buffers for groups
+  requested but not yet consumed. Bounds memory only. Raise it if the
+  backend runs dry between transfers; lower it if the engine is short of
+  VRAM during load.
+
+A group is never split across transfers and a tensor is never split
+across groups, so a tensor larger than the target simply gets a group of
+its own. Groups also break at object boundaries, at any gap in the byte
+range, and where a tensor's dtype could not be viewed at its offset
+within the group.
+
+```bash
+export MX_OBJ_PARAMS='{"accelerated":"true","type":"scality_ai_connector",
+  "endpoint_override":"http://10.0.0.1:81","split_size":"16777216","max_inflight":"64"}'
+```
+
+##### How the pieces fit
+
+A transfer completes as a unit — the backend reports done only once all
+of its requests have landed, with no per-request status. The group is
+therefore the delivery granularity as well as the descriptor size, which
+is why groups are kept to tens of MiB rather than batched per shard.
+
+The loader posts transfers as fast as the staging budget allows and does
+not count requests; `max_inflight` does that. Tensors are delivered in
+group-completion order, which is safe because engines match weights by
+name. Within a group, every tensor is a zero-copy slice of the one
+staging buffer.
+
+NIC spread is also the backend's job. It picks a rail per registration,
+so with several transfers in flight the rails balance themselves. Only
+when too few registrations are live to cover them — the start of a load,
+or groups so large that the staging budget admits one at a time — does it
+split a single buffer across the idle rails.
+
+##### Verifying a configuration
+
+At INFO the loader reports its plan and budget:
+
+```
+OBJ plan: 291 tensors in 164 group(s) across 2 shard object(s),
+13.5 GiB total, 84.2 MiB mean group (target 64 MiB)
+OBJ staging budget 2.0 GiB (auto, 8 descriptors); largest descriptor
+262.1 MiB, 60.4 GiB free
+```
+
+Mean group above the target means large tensors are getting groups of
+their own, which is expected on dense models. Mean group well below it
+means groups are breaking early — check for gaps or dtype misalignment
+in the checkpoint layout.
+
+With `UCX_LOG_LEVEL=DEBUG` (or the NIXL debug level) the connector
+reports, at teardown, whether the cap was the binding constraint:
+
+```
+RestClient teardown: peak_inflight=64, peak_pending=118, max_inflight=64
+```
+
+A non-zero `peak_pending` means requests queued on the cap, so
+`max_inflight` was the limit. A `peak_inflight` below the cap means the
+loader never supplied enough work — raise `MX_OBJ_STAGING_MB` before
+touching anything else.
 
 Runtime prerequisites:
 
