@@ -285,11 +285,11 @@ class ObjTransferManager:
     def open_pool(self, pool_bytes: int, device: torch.device) -> None:
         """Allocate one staging buffer and register it once for the whole load.
 
-        Registration pins pages and costs time proportional to the bytes pinned --
-        measured at ~0.076 ms/MiB on an H100 with four rails. Registering each
-        transfer's destination separately therefore pins the entire model over the
-        course of a load: 51.1 GiB and 3.98s of a 4.47s Gemma-3-27B load. Pinning
-        one pool instead makes that a constant.
+        Registration cost tracks the number of memory regions far more than the
+        bytes in them: on an H100 with four rails, ibv_reg_mr costs ~1.0 ms and
+        ibv_dereg_mr ~0.65 ms per MR regardless of size, plus only ~0.008 ms/MiB.
+        A 4 GiB pool is therefore 4 MRs and 34 ms, where the same bytes registered
+        per transfer were 2328 MRs and 2.4s of a Gemma-3-27B load.
 
         NIXL keeps registration and transfer descriptors separate, so a transfer may
         name any sub-range of registered memory; the DC token client resolves each
