@@ -55,14 +55,20 @@ _URI_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 # where one transfer per tensor would mean tens of thousands of them.
 _DEFAULT_GROUP_BYTES = 64 * 1024 * 1024
 
-# Descriptors the staging budget aims to keep outstanding. The budget is derived
-# from what keeps the backend fed rather than from what VRAM happens to be free:
-# past saturation, extra staging buys nothing and takes memory from the engine.
-_STAGING_DESCRIPTORS = 8
-
-# Floor for the staging budget, so small-descriptor models still queue enough
-# work to cover request latency.
-_MIN_STAGING_BYTES = 2 * 1024 * 1024 * 1024
+# Staging budget: bytes of buffers allowed outstanding, i.e. requested but not yet
+# consumed. Its only job is to keep the backend's request queue non-empty; past
+# that it buys nothing and takes memory the engine needs.
+#
+# A flat floor, not a multiple of the largest descriptor. Scaling by the largest
+# was wrong because groups are not uniform -- coalescing caps them at the target
+# but cannot split a tensor, so one oversized tensor sets the maximum for the whole
+# model. Gemma-3-27B's 2.6 GiB embedding produced a 21.0 GiB budget against a mean
+# group of 159 MiB, which was 98.6% of the VRAM ceiling and roughly 5x more queue
+# than any cap can use.
+#
+# 4 GiB is what saturates a plausible cap: 512 concurrent requests of 8 MiB. Above
+# the cap the extra queue is idle bytes.
+_MIN_STAGING_BYTES = 4 * 1024 * 1024 * 1024
 
 # Hard ceiling on the staging budget as a share of currently-free VRAM, so a
 # model with very large tensors cannot budget itself into an OOM.
@@ -253,14 +259,13 @@ class MxObjLoader:
     def _resolve_staging_budget(self, largest_group: int) -> int:
         """Bytes of staging buffers allowed outstanding at once.
 
-        Sized by what keeps the backend fed -- a handful of descriptors in flight
-        -- not by what VRAM is free. Past saturation extra staging buys no
-        throughput and simply takes memory the engine needs, so a machine with
-        60 GiB spare should not stage 15 GiB to keep 512 MB on the wire.
+        Sized by what keeps the backend's queue non-empty, not by what VRAM is
+        free and not by the largest descriptor. Past saturation extra staging buys
+        no throughput and simply takes memory the engine needs.
 
         Clamped to a share of free VRAM so a model with very large tensors cannot
-        budget itself into an OOM. A single group larger than the budget is still
-        admitted by the feed loop, since refusing it would stall the load.
+        budget itself into an OOM, and raised to admit one group when even that is
+        too small -- the feed loop always admits one, so the budget should say so.
         """
         override = os.environ.get("MX_OBJ_STAGING_MB")
         free, _total = torch.cuda.mem_get_info(self._device_id)
@@ -274,8 +279,9 @@ class MxObjLoader:
             budget = int(override) * 1024 * 1024
             source = "MX_OBJ_STAGING_MB"
         else:
-            budget = max(_MIN_STAGING_BYTES, _STAGING_DESCRIPTORS * largest_group)
-            source = f"auto, {_STAGING_DESCRIPTORS} descriptors"
+            # Flat: a single oversized tensor must not drag the whole budget up.
+            budget = max(_MIN_STAGING_BYTES, largest_group)
+            source = "auto"
 
         ceiling = int(available * _STAGING_VRAM_CEILING)
         if budget > ceiling:

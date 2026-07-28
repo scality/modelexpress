@@ -460,16 +460,32 @@ class TestCoalescing:
 class TestStagingBudget:
     """Sized by what keeps the backend fed, not by what VRAM is free."""
 
-    def test_scales_with_largest_descriptor(self):
-        from modelexpress.obj_loader import _STAGING_DESCRIPTORS
+    def test_does_not_scale_with_the_largest_descriptor(self):
+        # A single oversized tensor must not set the budget for the whole model.
+        # Gemma-3-27B's 2.6 GiB embedding against a 159 MiB mean group produced a
+        # 21 GiB budget under the old 8x-largest rule.
+        from modelexpress.obj_loader import _MIN_STAGING_BYTES
 
         loader = _loader()
-        big = 512 * 1024 * 1024   # above the 2 GiB floor once multiplied
         a, b, c = _cuda_mem(free=64 * 1024 ** 3)
         with a, b, c, patch.dict("os.environ", {}, clear=False):
             import os
             os.environ.pop("MX_OBJ_STAGING_MB", None)
-            assert loader._resolve_staging_budget(big) == _STAGING_DESCRIPTORS * big
+            small = loader._resolve_staging_budget(159 * 1024 * 1024)
+            huge = loader._resolve_staging_budget(2688 * 1024 * 1024)
+        assert small == _MIN_STAGING_BYTES
+        assert huge == _MIN_STAGING_BYTES, "an outlier tensor inflated the budget"
+
+    def test_raised_to_admit_an_oversized_group(self):
+        # Beyond the floor the budget must still hold one whole group, since the
+        # feed loop admits one regardless.
+        loader = _loader()
+        giant = 8 * 1024 ** 3
+        a, b, c = _cuda_mem(free=128 * 1024 ** 3)
+        with a, b, c, patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("MX_OBJ_STAGING_MB", None)
+            assert loader._resolve_staging_budget(giant) == giant
 
     def test_does_not_scale_with_free_vram(self):
         # The old formula took a share of free VRAM; the budget must now be the

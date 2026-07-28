@@ -405,7 +405,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_OBJ_PARAMS` | `{}` | JSON object of NIXL OBJ backend parameters, passed verbatim to the backend — ModelExpress adds nothing and overrides nothing, so any key left unset keeps the backend's own default. Selects the engine and its connection settings (`type`, `accelerated`, `endpoint_override`, `bucket`, `region`, `crtMinLimit`, `num_threads`, credentials, ...), and carries the two transfer knobs `split_size` and `max_inflight` — see [Throughput tuning](#throughput-tuning). See the NIXL OBJ plugin README for the full vocabulary. |
 | `MX_OBJ_TIMEOUT` | `300` | OBJ transfer timeout in seconds, measured from when a transfer is posted. |
 | `MX_OBJ_GROUP_MB` | `64` | Target size of one OBJ transfer. Consecutive tensors in a shard are coalesced into contiguous groups of about this size, so one descriptor covers several tensors. Sets both the descriptor size the backend sees and the delivery granularity (a group's tensors become available together). |
-| `MX_OBJ_STAGING_MB` | (auto: `max(2048, 8 x largest group)`, capped at 50% of free VRAM) | GPU memory the loader may hold in staging buffers for groups requested but not yet consumed. Bounds memory only, not request count. Derived from what keeps the backend fed rather than from free VRAM, so a mostly-idle GPU does not stage tens of GiB to no benefit. A group bigger than the budget is always admitted. |
+| `MX_OBJ_STAGING_MB` | (auto: `max(4096, largest group)`, capped at 50% of free VRAM) | GPU memory the loader may hold in staging buffers for groups requested but not yet consumed. Bounds memory only, not request count — its job is just to keep the backend's request queue non-empty, and 4 GiB covers 512 concurrent 8 MiB requests. Flat rather than a multiple of the largest group, because coalescing cannot split a tensor and one oversized tensor would otherwise set the budget for the whole model. A group bigger than the budget is always admitted. |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
@@ -547,10 +547,10 @@ split a single buffer across the idle rails.
 At INFO the loader reports its plan and budget:
 
 ```
-OBJ plan: 291 tensors in 164 group(s) across 2 shard object(s),
-13.5 GiB total, 84.2 MiB mean group (target 64 MiB)
-OBJ staging budget 2.0 GiB (auto, 8 descriptors); largest descriptor
-262.1 MiB, 60.4 GiB free
+OBJ plan: 1247 tensors in 328 group(s) across 127 shard object(s),
+51.1 GiB total, 159.5 MiB mean group (target 64 MiB)
+OBJ staging budget 4.0 GiB (auto); largest descriptor 2688.7 MiB,
+42.6 GiB free
 ```
 
 Mean group above the target means large tensors are getting groups of
