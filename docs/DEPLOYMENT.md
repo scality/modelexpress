@@ -498,6 +498,19 @@ Neither knob is set by ModelExpress. `MX_OBJ_PARAMS` is forwarded
 untouched, so leaving a key out keeps the backend's default — transport
 tuning belongs to the backend, not the loader.
 
+- `dram_rdma` (default `true` in the backend, defaulted to `false` by
+  ModelExpress) — whether host-memory transfers use RDMA. This is the one
+  key ModelExpress declares rather than forwards, and it is not tuning:
+  its only DRAM use is reading safetensors headers, which the backend
+  cannot know. Registration cost tracks the *number* of memory regions
+  rather than their size — about 1.0 ms per `ibv_reg_mr` and 0.65 ms per
+  `ibv_dereg_mr` on each rail, whatever the length — so an 8-byte header
+  probe over RDMA costs several ms of pinning to move 8 bytes. With
+  `false`, header reads pin nothing and arrive as plain HTTP response
+  bodies. Weights are VRAM and always use RDMA. Set it explicitly in
+  `MX_OBJ_PARAMS` to compare the two paths; a backend that does not know
+  the key ignores it.
+
 **Loader, via two knobs:**
 
 - `MX_OBJ_GROUP_MB` (default 64) — target transfer size. Consecutive

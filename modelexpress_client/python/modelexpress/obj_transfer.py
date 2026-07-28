@@ -30,6 +30,10 @@ each byte range is handed down as one descriptor and the OBJ backend cuts it int
 requests (``split_size``) and bounds how many run at once (``max_inflight``). We
 set neither -- ``MX_OBJ_PARAMS`` is forwarded verbatim, so an unset key keeps the
 backend's own default rather than one chosen here.
+
+The one exception is ``dram_rdma``, defaulted to false, and it is not tuning: it
+states that our host buffers hold metadata rather than bulk data, which no backend
+default can infer. See ``obj_backend_params``.
 """
 
 from __future__ import annotations
@@ -68,6 +72,15 @@ except ImportError:
 MAX_REG_BYTES = 4 * 1024 * 1024 * 1024 - 64 * 1024
 _OBJ_BACKEND = "OBJ"
 
+# Packing alignment for host reads. Only the packing is aligned, not the object
+# offsets, so this costs at most 63 bytes per range and keeps each range's write
+# off a shared cache line with its neighbour.
+_HOST_READ_ALIGN = 64
+
+
+def _align_up(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
 # Backend parameter keys that must never be logged.
 _SENSITIVE_PARAMS = frozenset({"access_key", "secret_key", "session_token"})
 
@@ -78,18 +91,26 @@ def obj_backend_params() -> dict[str, str]:
     Returns a (possibly empty) map of string->string suitable for
     ``create_backend("OBJ", params)``. Raises ValueError if MX_OBJ_PARAMS
     is set but is not a JSON object.
+
+    Defaults ``dram_rdma`` to false. That is not transport tuning -- it declares how
+    we use host memory, which the backend cannot know: our only DRAM use is reading
+    metadata, where RDMA costs one memory registration per range and buys nothing.
+    An explicit value in MX_OBJ_PARAMS still wins, which is how the two paths get
+    compared. A backend that does not know the key ignores it.
     """
     raw = os.environ.get("MX_OBJ_PARAMS", "")
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"MX_OBJ_PARAMS is not valid JSON: {e}") from e
-    if not isinstance(parsed, dict):
-        raise ValueError("MX_OBJ_PARAMS must be a JSON object of backend params")
-    # The NIXL backend expects all parameter values as strings.
-    return {str(k): str(v) for k, v in parsed.items()}
+    params: dict[str, str] = {}
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"MX_OBJ_PARAMS is not valid JSON: {e}") from e
+        if not isinstance(parsed, dict):
+            raise ValueError("MX_OBJ_PARAMS must be a JSON object of backend params")
+        # The NIXL backend expects all parameter values as strings.
+        params = {str(k): str(v) for k, v in parsed.items()}
+    params.setdefault("dram_rdma", "false")
+    return params
 
 
 def _redact(params: dict[str, str]) -> dict[str, str]:
@@ -349,6 +370,101 @@ class ObjTransferManager:
         self._obj_reg = self._agent.register_memory(regions, "OBJ")
         logger.info("OBJ keys registered: %d object(s)", len(regions))
 
+    def read_ranges_to_host(
+        self, reads: list[tuple[str, int, int]]
+    ) -> list[bytes]:
+        """Read many small object ranges into host memory, as one transfer.
+
+        Takes ``(object_key, object_offset, size)`` and returns the bytes of each
+        read, in the order given.
+
+        For metadata, not for weights. Reading N ranges the way weights are read
+        costs one registration per range, and registration cost tracks the number
+        of memory regions rather than their size: roughly 1.0 ms to pin a region on
+        each rail and 0.65 ms to release it, whatever the length. A 127-shard model's
+        safetensors headers cost 1016 memory regions and 1.6s that way, to move a few
+        MiB. Packing every range into one buffer makes it one registration.
+
+        The buffer is host memory, so the parsed bytes need no device-to-host copy,
+        and with the backend's ``dram_rdma=false`` it is not pinned at all -- the
+        ranges arrive as plain HTTP response bodies.
+
+        A range may come back short if it reaches past the end of its object; the
+        transfer still succeeds and the tail of that range stays zero. Callers that
+        over-read on purpose rely on this.
+        """
+        if self._agent is None:
+            raise RuntimeError("OBJ agent not initialized")
+        if not reads:
+            return []
+
+        # Zeroed, not empty: a short read leaves its tail untouched, and that tail
+        # must not read back as whatever was in the page before.
+        offsets = []
+        total = 0
+        for _key, _obj_offset, size in reads:
+            total = _align_up(total, _HOST_READ_ALIGN)
+            offsets.append(total)
+            total += size
+        host = torch.zeros(total, dtype=torch.uint8)
+        base = host.data_ptr()
+
+        obj_regions = []
+        dram_descs_in = []
+        obj_descs_in = []
+        for (key, obj_offset, size), pool_offset in zip(reads, offsets, strict=True):
+            # A distinct devId per range, from the monotonic counter: the backend
+            # resolves an object key by the remote descriptor's devId, so sharing one
+            # would collapse every key onto a single map slot.
+            dev_id = self._next_obj_dev_id
+            self._next_obj_dev_id += 1
+            obj_regions.append((0, max(1, obj_offset + size), dev_id, key))
+            dram_descs_in.append((base + pool_offset, size, 0))
+            obj_descs_in.append((obj_offset, size, dev_id))
+
+        obj_reg = self._agent.register_memory(obj_regions, "OBJ")
+        try:
+            host_reg = self._agent.register_memory([(base, total, 0, "")], "DRAM")
+        except Exception:
+            # Outside the block below, so the OBJ keys registered above are not
+            # left behind when the buffer's own registration is what failed.
+            self._agent.deregister_memory(obj_reg)
+            raise
+        xfer = None
+        try:
+            dram_descs = self._agent.get_xfer_descs(dram_descs_in, "DRAM")
+            obj_descs = self._agent.get_xfer_descs(obj_descs_in, "OBJ")
+            xfer = self._agent.initialize_xfer(
+                "READ", dram_descs, obj_descs, self._agent.name
+            )
+            handle = ObjBatchHandle(
+                buffers=[],
+                label=f"{len(reads)} host range(s) from '{reads[0][0]}'",
+                descriptors=len(reads),
+                posted_at=time.perf_counter(),
+                xfer=xfer,
+                obj_descs=None,
+                vram_descs=None,
+            )
+            state = self._agent.transfer(xfer)
+            if state == "ERR":
+                raise RuntimeError(
+                    f"OBJ host read failed for {handle.label}"
+                )
+            xfer = None  # wait_objects owns the handle from here
+            self.wait_objects(handle)
+            arr = host.numpy()
+            return [
+                bytes(arr[pool_offset:pool_offset + size])
+                for (_key, _obj_offset, size), pool_offset in zip(
+                    reads, offsets, strict=True
+                )
+            ]
+        finally:
+            if xfer is not None:
+                self._agent.release_xfer_handle(xfer)
+            self._free_nixl_memory(obj_reg, host_reg)
+
     def submit_pooled(
         self, object_key: str, obj_offset: int, size: int, pool_offset: int
     ) -> ObjBatchHandle:
@@ -542,10 +658,10 @@ class ObjTransferManager:
         buf = self.batch_load_object(object_key, [(offset, length)], device)[0]
         return bytes(buf.cpu().numpy())
 
-    def _free_nixl_memory(self, obj_descs: Any, vram_descs: Any) -> None:
-        """Deregister OBJ and VRAM descriptors from the NIXL agent."""
+    def _free_nixl_memory(self, obj_descs: Any, local_descs: Any) -> None:
+        """Deregister an OBJ registration and its local (VRAM or DRAM) counterpart."""
         self._agent.deregister_memory(obj_descs)
-        self._agent.deregister_memory(vram_descs)
+        self._agent.deregister_memory(local_descs)
 
     def shutdown(self) -> None:
         """Clean up NIXL OBJ resources."""

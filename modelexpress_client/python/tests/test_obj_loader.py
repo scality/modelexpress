@@ -42,12 +42,14 @@ class TestIsObjAvailable:
 class TestObjBackendParams:
     """Tests for the generic MX_OBJ_PARAMS pass-through."""
 
-    def test_unset_returns_empty(self):
+    def test_unset_returns_only_the_dram_declaration(self):
+        # Our host buffers hold metadata, which no backend default can infer, so
+        # this one key is declared even with nothing configured.
         from modelexpress.obj_transfer import obj_backend_params
         with patch.dict("os.environ", {}, clear=False):
             import os
             os.environ.pop("MX_OBJ_PARAMS", None)
-            assert obj_backend_params() == {}
+            assert obj_backend_params() == {"dram_rdma": "false"}
 
     def test_parses_and_stringifies(self):
         from modelexpress.obj_transfer import obj_backend_params
@@ -58,7 +60,15 @@ class TestObjBackendParams:
             "accelerated": "True",
             "type": "vendor_engine",
             "num_threads": "8",
+            "dram_rdma": "false",
         }
+
+    def test_explicit_dram_rdma_is_not_overridden(self):
+        # The operator's value wins; this is how the RDMA and HTTP header paths
+        # get compared against each other.
+        from modelexpress.obj_transfer import obj_backend_params
+        with patch.dict("os.environ", {"MX_OBJ_PARAMS": '{"dram_rdma": "true"}'}):
+            assert obj_backend_params()["dram_rdma"] == "true"
 
     def test_invalid_json_raises(self):
         from modelexpress.obj_transfer import obj_backend_params
@@ -361,7 +371,7 @@ def _plan(loader, headers, **env):
         import os
         if "MX_OBJ_GROUP_MB" not in env:
             os.environ.pop("MX_OBJ_GROUP_MB", None)
-        return loader._build_plan("", list(headers), None)
+        return loader._build_plan("", list(headers))
 
 
 # ---------------------------------------------------------------------------
@@ -886,3 +896,291 @@ class TestOpenPool:
         assert len(buffers) == 1
         gc.collect()
         assert buffers[0]() is None, "the staging buffer outlived the failure"
+
+
+# ---------------------------------------------------------------------------
+# Speculative header probe
+# ---------------------------------------------------------------------------
+
+
+def _safetensors_blob(tensors_per_shard, tensor_size=1024, dtype="U8", pad=0):
+    """A real safetensors prefix: u64 length, JSON header, then `pad` data bytes."""
+    header = {
+        f"t{i}": {
+            "dtype": dtype,
+            "shape": [tensor_size],
+            "data_offsets": [i * tensor_size, (i + 1) * tensor_size],
+        }
+        for i in range(tensors_per_shard)
+    }
+    raw = json.dumps(header).encode()
+    return struct.pack("<Q", len(raw)) + raw + b"\x00" * pad
+
+
+class _ReadRecorder:
+    """Manager stand-in serving byte ranges out of in-memory objects."""
+
+    def __init__(self, objects: dict[str, bytes]):
+        self.objects = objects
+        self.batches: list[list[tuple[str, int, int]]] = []
+
+    def read_ranges_to_host(self, reads):
+        self.batches.append(list(reads))
+        out = []
+        for key, offset, size in reads:
+            blob = self.objects[key]
+            # Matches the real contract: always `size` bytes back, with the tail
+            # left zero when the range reaches past the end of the object (which
+            # the connector answers as a complete but shorter 206).
+            got = blob[offset:offset + size]
+            out.append(got + b"\x00" * (size - len(got)))
+        return out
+
+
+class TestHeaderProbe:
+    """One round trip when the header fits the probe; a second only when it does not."""
+
+    def test_single_batch_when_headers_fit_the_probe(self):
+        from modelexpress.obj_loader import _HEADER_PROBE_BYTES
+
+        blob = _safetensors_blob(4, pad=4096)
+        manager = _ReadRecorder({"a.safetensors": blob, "b.safetensors": blob})
+        loader = _loader(manager)
+
+        headers = loader._parse_object_headers(["a.safetensors", "b.safetensors"])
+
+        assert len(manager.batches) == 1, "a fitting header must not need a second read"
+        assert manager.batches[0] == [
+            ("a.safetensors", 0, _HEADER_PROBE_BYTES),
+            ("b.safetensors", 0, _HEADER_PROBE_BYTES),
+        ]
+        assert sorted(headers) == ["a.safetensors", "b.safetensors"]
+        assert sorted(headers["a.safetensors"]) == ["t0", "t1", "t2", "t3"]
+        assert headers["a.safetensors"]["t0"]["size"] == 1024
+
+    def test_short_probe_response_still_parses(self):
+        # The object is far smaller than the probe, so the read comes back short.
+        # Nothing needed is lost: a valid object holds its whole header.
+        blob = _safetensors_blob(2, pad=16)
+        manager = _ReadRecorder({"tiny.safetensors": blob})
+        loader = _loader(manager)
+
+        headers = loader._parse_object_headers(["tiny.safetensors"])
+
+        assert len(manager.batches) == 1
+        assert sorted(headers["tiny.safetensors"]) == ["t0", "t1"]
+
+    def test_second_batch_only_for_shards_that_overflow(self):
+        from modelexpress.obj_loader import _HEADER_PROBE_BYTES
+
+        small = _safetensors_blob(2, pad=64)
+        # Enough tensors that the JSON header cannot fit in the probe.
+        big = _safetensors_blob(2000, pad=64)
+        assert len(big) > _HEADER_PROBE_BYTES, "fixture must actually overflow"
+        manager = _ReadRecorder({"small.safetensors": small, "big.safetensors": big})
+        loader = _loader(manager)
+
+        headers = loader._parse_object_headers(
+            ["small.safetensors", "big.safetensors"]
+        )
+
+        assert len(manager.batches) == 2
+        assert [k for k, _o, _s in manager.batches[1]] == ["big.safetensors"], \
+            "the follow-up must carry only the shards that overflowed"
+        assert manager.batches[1][0][1] == 8, "follow-up reads the JSON, not the u64"
+        assert len(headers["small.safetensors"]) == 2
+        assert len(headers["big.safetensors"]) == 2000
+
+    def test_empty_object_raises_rather_than_parsing_zeros(self):
+        # A zero-filled buffer decodes as header_size 0, which must not be mistaken
+        # for a valid empty header, and must say so rather than failing in json.
+        manager = _ReadRecorder({"empty.safetensors": b""})
+        loader = _loader(manager)
+        with pytest.raises(RuntimeError, match="no safetensors header"):
+            loader._parse_object_headers(["empty.safetensors"])
+
+    def test_no_keys_reads_nothing(self):
+        manager = _ReadRecorder({})
+        loader = _loader(manager)
+        assert loader._parse_object_headers([]) == {}
+        assert manager.batches == []
+
+
+# ---------------------------------------------------------------------------
+# read_ranges_to_host
+# ---------------------------------------------------------------------------
+
+
+class _HostReadAgent:
+    """Agent stub that fulfils a DRAM transfer by writing into the real buffer.
+
+    The DRAM descriptors carry genuine pointers into the manager's tensor, so this
+    exercises the actual packing arithmetic rather than a model of it.
+    """
+
+    name = "stub"
+
+    def __init__(self, objects: dict[str, bytes]):
+        self.objects = objects
+        self.registrations: list[tuple[str, int]] = []  # (mem_type, region count)
+        self.dram_descs: list[tuple[int, int, int]] = []
+        self.obj_descs: list[tuple[int, int, int]] = []
+        self.dev_to_key: dict[int, str] = {}
+        self.released = 0
+
+    def register_memory(self, regions, mem_type):
+        self.registrations.append((mem_type, len(regions)))
+        if mem_type == "OBJ":
+            for _addr, _len, dev_id, key in regions:
+                self.dev_to_key[dev_id] = key
+        return f"{mem_type}-reg-{len(self.registrations)}"
+
+    def deregister_memory(self, reg):
+        self.released += 1
+
+    def get_xfer_descs(self, descs, mem_type):
+        if mem_type == "DRAM":
+            self.dram_descs = list(descs)
+        else:
+            self.obj_descs = list(descs)
+        return (mem_type, list(descs))
+
+    def initialize_xfer(self, op, local, remote, agent_name):
+        return ("xfer", local, remote)
+
+    def transfer(self, xfer):
+        import ctypes
+        for (addr, size, _dev), (obj_off, obj_size, dev_id) in zip(
+            self.dram_descs, self.obj_descs, strict=True
+        ):
+            assert size == obj_size
+            blob = self.objects[self.dev_to_key[dev_id]]
+            payload = blob[obj_off:obj_off + size]
+            if payload:
+                ctypes.memmove(addr, payload, len(payload))
+        return "DONE"
+
+    def check_xfer_state(self, xfer):
+        return "DONE"
+
+    def release_xfer_handle(self, xfer):
+        self.released += 1
+
+
+class TestReadRangesToHost:
+    """One buffer, one DRAM registration, bytes back in the order asked for."""
+
+    @staticmethod
+    def _manager(agent):
+        from modelexpress.obj_transfer import ObjTransferManager
+        mgr = ObjTransferManager(agent_name="test", params={})
+        mgr._agent = agent
+        mgr._device_id = 0
+        return mgr
+
+    def test_returns_each_range_in_order(self):
+        objects = {
+            "a": b"".join(bytes([i]) * 10 for i in range(1, 4)),
+            "b": bytes(range(64, 128)),
+        }
+        agent = _HostReadAgent(objects)
+        mgr = self._manager(agent)
+
+        out = mgr.read_ranges_to_host(
+            [("a", 0, 10), ("b", 4, 8), ("a", 20, 10)]
+        )
+
+        assert out == [
+            objects["a"][0:10],
+            objects["b"][4:12],
+            objects["a"][20:30],
+        ]
+
+    def test_one_dram_registration_regardless_of_range_count(self):
+        objects = {f"k{i}": bytes([i]) * 32 for i in range(20)}
+        agent = _HostReadAgent(objects)
+        mgr = self._manager(agent)
+
+        mgr.read_ranges_to_host([(f"k{i}", 0, 32) for i in range(20)])
+
+        dram = [r for r in agent.registrations if r[0] == "DRAM"]
+        obj = [r for r in agent.registrations if r[0] == "OBJ"]
+        assert dram == [("DRAM", 1)], "the whole buffer must be one registration"
+        assert obj == [("OBJ", 20)], "OBJ keys are one call, one region per key"
+        assert len(agent.dram_descs) == 20, "one descriptor pair per range"
+
+    def test_ranges_are_aligned_and_non_overlapping_in_the_buffer(self):
+        from modelexpress.obj_transfer import _HOST_READ_ALIGN
+
+        objects = {"a": bytes(200), "b": bytes(200), "c": bytes(200)}
+        agent = _HostReadAgent(objects)
+        mgr = self._manager(agent)
+
+        # Sizes chosen so naive packing would leave them unaligned.
+        mgr.read_ranges_to_host([("a", 0, 7), ("b", 0, 3), ("c", 0, 100)])
+
+        base = min(addr for addr, _s, _d in agent.dram_descs)
+        spans = [(addr - base, size) for addr, size, _d in agent.dram_descs]
+        for offset, _size in spans:
+            assert offset % _HOST_READ_ALIGN == 0, f"unaligned pack offset {offset}"
+        spans.sort()
+        for (off_a, size_a), (off_b, _size_b) in zip(spans, spans[1:], strict=False):
+            assert off_a + size_a <= off_b, "packed ranges overlap"
+
+    def test_distinct_dev_ids_so_keys_do_not_collide(self):
+        # The backend resolves an object key from the remote descriptor's devId, so
+        # two ranges sharing one devId would collapse onto a single key.
+        objects = {"a": bytes(64), "b": bytes(64)}
+        agent = _HostReadAgent(objects)
+        mgr = self._manager(agent)
+
+        mgr.read_ranges_to_host([("a", 0, 8), ("b", 0, 8), ("a", 8, 8)])
+
+        dev_ids = [dev for _off, _size, dev in agent.obj_descs]
+        assert len(set(dev_ids)) == 3, f"devIds must be distinct, got {dev_ids}"
+
+    def test_registrations_released_even_on_failure(self):
+        objects = {"a": bytes(64)}
+        agent = _HostReadAgent(objects)
+        agent.transfer = lambda xfer: "ERR"
+        mgr = self._manager(agent)
+
+        with pytest.raises(RuntimeError, match="host read failed"):
+            mgr.read_ranges_to_host([("a", 0, 8)])
+
+        assert agent.released >= 2, "OBJ and DRAM registrations must both be freed"
+
+    def test_no_reads_is_a_no_op(self):
+        agent = _HostReadAgent({})
+        mgr = self._manager(agent)
+        assert mgr.read_ranges_to_host([]) == []
+        assert agent.registrations == []
+
+
+class TestReadRangesToHostFailurePaths:
+    """Neither registration may outlive a failure of the other."""
+
+    def test_obj_registration_freed_when_the_buffer_registration_fails(self):
+        from modelexpress.obj_transfer import ObjTransferManager
+
+        freed = []
+
+        class _Agent:
+            name = "stub"
+
+            def register_memory(self, regions, mem_type):
+                if mem_type == "DRAM":
+                    raise RuntimeError("NIXL_ERR_BACKEND")
+                return "obj-reg"
+
+            def deregister_memory(self, reg):
+                freed.append(reg)
+
+        mgr = ObjTransferManager(agent_name="test", params={})
+        mgr._agent = _Agent()
+        mgr._device_id = 0
+
+        with pytest.raises(RuntimeError, match="NIXL_ERR_BACKEND"):
+            mgr.read_ranges_to_host([("a", 0, 8)])
+
+        assert freed == ["obj-reg"], "the OBJ keys were left registered"

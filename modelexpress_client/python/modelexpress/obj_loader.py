@@ -83,6 +83,18 @@ _MIN_STAGING_BYTES = min(4 * 1024 * 1024 * 1024, MAX_REG_BYTES)
 # model with very large tensors cannot budget itself into an OOM.
 _STAGING_VRAM_CEILING = 0.5
 
+# Bytes read from the front of each shard when probing for its safetensors header.
+# Sized to hold the whole header so the u64 length and the JSON arrive together,
+# collapsing two dependent round trips into one.
+#
+# A safetensors entry is ~120-150 bytes of JSON (name, dtype, shape, data_offsets),
+# so 64 KiB covers roughly 450 tensors in one shard; sharded checkpoints run an
+# order of magnitude below that. Over-reading is close to free -- 127 shards x
+# 64 KiB is 8 MiB against ~190 KiB of real header, under a millisecond of transfer --
+# and a shard that does exceed it simply costs the follow-up read it would have
+# needed anyway.
+_HEADER_PROBE_BYTES = 64 * 1024
+
 
 class _PlannedTensor(NamedTuple):
     """One tensor within a group: where it sits in the group's buffer."""
@@ -256,7 +268,7 @@ class MxObjLoader:
 
         device = torch.device("cuda", self._device_id)
 
-        plan = self._build_plan(prefix, shard_basenames, device)
+        plan = self._build_plan(prefix, shard_basenames)
         if not plan:
             return
 
@@ -457,43 +469,69 @@ class MxObjLoader:
         )
 
     def _parse_object_headers(
-        self, object_keys: list[str], device: torch.device
+        self, object_keys: list[str]
     ) -> dict[str, dict[str, dict]]:
-        """Parse every shard's safetensors header in two batched round trips.
+        """Parse every shard's safetensors header, normally in one round trip.
 
-        A safetensors header needs two reads -- a u64 length, then that many bytes
-        of JSON -- and they are inherently sequential. Done per shard that is
-        2 * N sequential round trips before the first weight byte can move, which
-        on a many-shard model is the single longest serial stretch of the load.
-        Batching across shards makes it 2 regardless of shard count.
+        The format forces a dependency: a u64 length at offset 0, then that many
+        bytes of JSON, so the second read's range depends on the first read's
+        contents. Done literally that is two sequential stages, and before this the
+        first weight byte cannot move until both have finished.
+
+        One speculative read collapses them. Fetch the first _HEADER_PROBE_BYTES of
+        every shard in a single batch; the length and the JSON both come back
+        together unless a shard's header is bigger than the probe, which then needs
+        one follow-up batch for those shards alone.
+
+        A probe reaching past the end of a small object comes back short, which is
+        harmless: the only bytes lost are past the object's end, and a valid
+        safetensors object always contains its whole header. So whenever the header
+        fits the probe, it is entirely present.
         """
         if not object_keys:
             return {}
 
-        sizes = self._obj_manager.batch_load_objects(
-            [(key, [(0, HEADER_LEN_SIZE)]) for key in object_keys], device
+        probes = self._obj_manager.read_ranges_to_host(
+            [(key, 0, _HEADER_PROBE_BYTES) for key in object_keys]
         )
-        header_sizes = [
-            parse_header_size(bytes(bufs[0].cpu().numpy())) for bufs in sizes
-        ]
 
-        blobs = self._obj_manager.batch_load_objects(
-            [
-                (key, [(HEADER_LEN_SIZE, size)])
-                for key, size in zip(object_keys, header_sizes, strict=True)
-            ],
-            device,
-        )
-        return {
-            key: parse_header_json(bytes(bufs[0].cpu().numpy()))
-            for key, bufs in zip(object_keys, blobs, strict=True)
-        }
+        headers: dict[str, dict[str, dict]] = {}
+        overflowed: list[tuple[str, int, int]] = []
+        for key, raw in zip(object_keys, probes, strict=True):
+            header_size = parse_header_size(raw)
+            if header_size == 0:
+                # The probe buffer starts zeroed, so this is what an object that
+                # returned nothing looks like. Say that, rather than letting it
+                # surface as a JSON error on an empty slice.
+                raise RuntimeError(
+                    f"object '{key}' has no safetensors header: it is empty, "
+                    f"missing, or not a safetensors blob"
+                )
+            end = HEADER_LEN_SIZE + header_size
+            if end <= len(raw):
+                headers[key] = parse_header_json(raw[HEADER_LEN_SIZE:end])
+            else:
+                overflowed.append((key, HEADER_LEN_SIZE, header_size))
+
+        if overflowed:
+            logger.info(
+                "OBJ header probe of %d KiB too small for %d of %d shard(s); "
+                "reading those headers in a second round trip",
+                _HEADER_PROBE_BYTES // 1024, len(overflowed), len(object_keys),
+            )
+            for (key, _offset, _size), raw in zip(
+                overflowed,
+                self._obj_manager.read_ranges_to_host(overflowed),
+                strict=True,
+            ):
+                headers[key] = parse_header_json(raw)
+
+        return headers
 
     def _build_plan(
         self,
         prefix: str,
         shard_basenames: list[str],
-        device: torch.device,
     ) -> list[_PlannedGroup]:
         """Flatten every shard's header into an ordered list of groups to fetch.
 
@@ -517,7 +555,7 @@ class MxObjLoader:
         simply gets a group of its own.
         """
         object_keys = [self._object_key(prefix, b) for b in shard_basenames]
-        headers = self._parse_object_headers(object_keys, device)
+        headers = self._parse_object_headers(object_keys)
 
         override = os.environ.get("MX_OBJ_GROUP_MB")
         target = (
