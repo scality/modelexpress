@@ -3,8 +3,10 @@
 
 """Tests for the OBJ loader and transfer manager."""
 
+import gc
 import json
 import struct
+import weakref
 from unittest.mock import patch
 
 import pytest
@@ -501,15 +503,33 @@ class TestStagingBudget:
         assert huge == _MIN_STAGING_BYTES, "an outlier tensor inflated the budget"
 
     def test_raised_to_admit_an_oversized_group(self):
-        # Beyond the floor the budget must still hold one whole group, since the
-        # feed loop admits one regardless.
+        # The VRAM clamp must not cut the budget below one group: the feed loop
+        # admits one regardless, so a budget that cannot hold it is a lie. The
+        # floor now sits at the registration limit, so the clamp path is the only
+        # one that can leave the budget below a group.
         loader = _loader()
-        giant = 8 * 1024 ** 3
-        a, b, c = _cuda_mem(free=128 * 1024 ** 3)
+        big = 3 * 1024 ** 3               # over the 50% ceiling of 4 GiB free
+        a, b, c = _cuda_mem(free=4 * 1024 ** 3)
         with a, b, c, patch.dict("os.environ", {}, clear=False):
             import os
             os.environ.pop("MX_OBJ_STAGING_MB", None)
-            assert loader._resolve_staging_budget(giant) == giant
+            assert loader._resolve_staging_budget(big) == big
+
+    def test_never_exceeds_the_registration_limit(self):
+        # The pool is a single registration, so no input -- an oversized group,
+        # an override, or abundant VRAM -- may push the budget past what the
+        # backend will register. Asking for more fails the whole load.
+        from modelexpress.obj_transfer import MAX_REG_BYTES
+
+        loader = _loader()
+        a, b, c = _cuda_mem(free=512 * 1024 ** 3)
+        with a, b, c, patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("MX_OBJ_STAGING_MB", None)
+            assert loader._resolve_staging_budget(64 * 1024 ** 3) == MAX_REG_BYTES
+        a, b, c = _cuda_mem(free=512 * 1024 ** 3)
+        with a, b, c, patch.dict("os.environ", {"MX_OBJ_STAGING_MB": "65536"}):
+            assert loader._resolve_staging_budget(1024) == MAX_REG_BYTES
 
     def test_does_not_scale_with_free_vram(self):
         # The old formula took a share of free VRAM; the budget must now be the
@@ -800,3 +820,69 @@ class TestFeedLoop:
 
         assert manager.outstanding() == [], "posted transfers were left unawaited"
         assert manager.closed, "the pool must be released even on abandonment"
+
+
+# ---------------------------------------------------------------------------
+# Pool registration
+# ---------------------------------------------------------------------------
+
+
+class _RegAgent:
+    """Minimal agent stub: register_memory either succeeds or raises."""
+
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.calls = 0
+
+    def register_memory(self, regions, mem_type):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("NIXL_ERR_BACKEND")
+        return object()
+
+
+class TestOpenPool:
+    """The pool is one registration, so its size and failure path both matter."""
+
+    @staticmethod
+    def _manager(agent):
+        from modelexpress.obj_transfer import ObjTransferManager
+        manager = ObjTransferManager(agent_name="mx-obj-test", params={})
+        manager._agent = agent
+        manager._device_id = 0
+        return manager
+
+    def test_rejects_a_pool_the_backend_cannot_register(self):
+        from modelexpress.obj_transfer import MAX_REG_BYTES
+
+        agent = _RegAgent()
+        manager = self._manager(agent)
+        with pytest.raises(RuntimeError, match="registration limit"):
+            manager.open_pool(MAX_REG_BYTES + 1, torch.device("cpu"))
+        assert agent.calls == 0, "an unregistrable size must not reach the backend"
+        assert manager.pool is None
+
+    def test_releases_the_buffer_when_registration_fails(self):
+        # The buffer is a large share of VRAM and the caller's next move is a
+        # fallback loader that needs it, so nothing may stay referenced.
+        agent = _RegAgent(fail=True)
+        manager = self._manager(agent)
+        buffers = []
+
+        real_empty = torch.empty
+
+        def tracking_empty(*args, **kwargs):
+            kwargs.pop("device", None)
+            tensor = real_empty(*args, **kwargs)
+            buffers.append(weakref.ref(tensor))
+            return tensor
+
+        with patch("torch.empty", tracking_empty), \
+             patch("torch.cuda.empty_cache"):
+            with pytest.raises(RuntimeError, match="NIXL_ERR_BACKEND"):
+                manager.open_pool(1024, torch.device("cpu"))
+
+        assert manager.pool is None
+        assert len(buffers) == 1
+        gc.collect()
+        assert buffers[0]() is None, "the staging buffer outlived the failure"

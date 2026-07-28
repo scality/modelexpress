@@ -58,9 +58,14 @@ try:
 except ImportError:
     pass
 
-# cuObject caps a single memory registration at 4 GiB. This is a hard backend
-# limit, not a tuning knob: ranges above it are split purely to stay registrable.
-_CUOBJ_MAX_REG_SIZE = 4 * 1024 * 1024 * 1024
+# cuObject caps a single memory registration just under 4 GiB, and the OBJ backend
+# applies that cap to every DRAM/VRAM registration. This is a hard backend limit,
+# not a tuning knob: ranges above it are split purely to stay registrable.
+#
+# The exact figure moved between CUDA releases -- cuobjclient.h defines it as
+# 4 GiB in 13.2 and 4 GiB - 64 KiB in 13.3 -- so use the smaller one, which is
+# valid against both. An exact 4 GiB registration is rejected on 13.3.
+MAX_REG_BYTES = 4 * 1024 * 1024 * 1024 - 64 * 1024
 _OBJ_BACKEND = "OBJ"
 
 # Backend parameter keys that must never be logged.
@@ -295,12 +300,25 @@ class ObjTransferManager:
             raise RuntimeError("OBJ agent not initialized")
         if self._pool is not None:
             raise RuntimeError("OBJ staging pool already open")
+        if pool_bytes > MAX_REG_BYTES:
+            raise RuntimeError(
+                f"OBJ staging pool of {pool_bytes} bytes exceeds the backend's "
+                f"registration limit of {MAX_REG_BYTES}"
+            )
 
-        self._pool = torch.empty(pool_bytes, dtype=torch.uint8, device=device)
+        pool = torch.empty(pool_bytes, dtype=torch.uint8, device=device)
         started = time.perf_counter()
-        self._pool_reg = self._agent.register_memory(
-            [(self._pool.data_ptr(), pool_bytes, self._device_id, "")], "VRAM"
-        )
+        try:
+            self._pool_reg = self._agent.register_memory(
+                [(pool.data_ptr(), pool_bytes, self._device_id, "")], "VRAM"
+            )
+        except Exception:
+            # Hold nothing on the failure path: this buffer is a large share of
+            # VRAM and the caller's next move is a fallback loader that needs it.
+            del pool
+            torch.cuda.empty_cache()
+            raise
+        self._pool = pool
         logger.info(
             "OBJ staging pool: %.1f GiB registered once in %.0fms",
             pool_bytes / (1024 ** 3), 1000 * (time.perf_counter() - started),
@@ -436,7 +454,7 @@ class ObjTransferManager:
 
                 loaded = 0
                 while True:
-                    span = min(size - loaded, _CUOBJ_MAX_REG_SIZE)
+                    span = min(size - loaded, MAX_REG_BYTES)
                     # OBJ descriptor: (offset_in_object, size, devId, object_key).
                     obj_regions.append((obj_offset + loaded, span, obj_dev_id, object_key))
                     vram_regions.append((gpu_base + loaded, span, self._device_id, ""))
@@ -531,5 +549,8 @@ class ObjTransferManager:
 
     def shutdown(self) -> None:
         """Clean up NIXL OBJ resources."""
+        # Deregistration needs the agent, so the pool goes first. Idempotent, so
+        # a loader that already closed its pool pays nothing.
+        self.close_pool()
         self._agent = None
         logger.info("ObjTransferManager shutdown complete")

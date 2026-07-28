@@ -35,7 +35,12 @@ from typing import Iterator, NamedTuple
 
 import torch
 
-from .obj_transfer import ObjBatchHandle, ObjTransferManager, is_obj_available
+from .obj_transfer import (
+    MAX_REG_BYTES,
+    ObjBatchHandle,
+    ObjTransferManager,
+    is_obj_available,
+)
 from .safetensors_meta import (
     HEADER_LEN_SIZE,
     SAFETENSORS_DTYPE_MAP,
@@ -69,7 +74,10 @@ _DEFAULT_GROUP_BYTES = 64 * 1024 * 1024
 #
 # 4 GiB is what saturates a plausible cap: 512 concurrent requests of 8 MiB. Above
 # the cap the extra queue is idle bytes.
-_MIN_STAGING_BYTES = 4 * 1024 * 1024 * 1024
+#
+# Capped by what the backend will register in one call, since the pool is one
+# registration: an unreachable default is not a default.
+_MIN_STAGING_BYTES = min(4 * 1024 * 1024 * 1024, MAX_REG_BYTES)
 
 # Hard ceiling on the staging budget as a share of currently-free VRAM, so a
 # model with very large tensors cannot budget itself into an OOM.
@@ -374,6 +382,12 @@ class MxObjLoader:
             )
             budget = max(ceiling, largest_group)
             source += ", VRAM-clamped"
+
+        # The pool is one registration, so it cannot exceed what the backend will
+        # register. This clamp is last because the two above can raise the budget.
+        if budget > MAX_REG_BYTES:
+            budget = MAX_REG_BYTES
+            source += ", registration-clamped"
 
         logger.info(
             "OBJ staging budget %.1f GiB (%s); largest descriptor %.1f MiB, "

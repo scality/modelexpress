@@ -405,7 +405,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_OBJ_PARAMS` | `{}` | JSON object of NIXL OBJ backend parameters, passed verbatim to the backend — ModelExpress adds nothing and overrides nothing, so any key left unset keeps the backend's own default. Selects the engine and its connection settings (`type`, `accelerated`, `endpoint_override`, `bucket`, `region`, `crtMinLimit`, `num_threads`, credentials, ...), and carries the two transfer knobs `split_size` and `max_inflight` — see [Throughput tuning](#throughput-tuning). See the NIXL OBJ plugin README for the full vocabulary. |
 | `MX_OBJ_TIMEOUT` | `300` | OBJ transfer timeout in seconds, measured from when a transfer is posted. |
 | `MX_OBJ_GROUP_MB` | `64` | Target size of one OBJ transfer. Consecutive tensors in a shard are coalesced into contiguous groups of about this size, so one descriptor covers several tensors. Sets both the descriptor size the backend sees and the delivery granularity (a group's tensors become available together). |
-| `MX_OBJ_STAGING_MB` | (auto: `max(4096, largest group)`, capped at 50% of free VRAM) | GPU memory the loader may hold in staging buffers for groups requested but not yet consumed. Bounds memory only, not request count — its job is just to keep the backend's request queue non-empty, and 4 GiB covers 512 concurrent 8 MiB requests. Flat rather than a multiple of the largest group, because coalescing cannot split a tensor and one oversized tensor would otherwise set the budget for the whole model. A group bigger than the budget is always admitted. |
+| `MX_OBJ_STAGING_MB` | (auto: `max(4096, largest group)`, capped at 50% of free VRAM) | GPU memory the loader may hold in staging buffers for groups requested but not yet consumed. Bounds memory only, not request count — its job is just to keep the backend's request queue non-empty, and 4 GiB covers 512 concurrent 8 MiB requests. Flat rather than a multiple of the largest group, because coalescing cannot split a tensor and one oversized tensor would otherwise set the budget for the whole model. A group bigger than the budget is always admitted. Capped at just under 4 GiB (the backend's single-registration limit) because the pool is one registration. |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
@@ -510,7 +510,9 @@ tuning belongs to the backend, not the loader.
 - `MX_OBJ_STAGING_MB` — GPU memory held in staging buffers for groups
   requested but not yet consumed. Bounds memory only. Raise it if the
   backend runs dry between transfers; lower it if the engine is short of
-  VRAM during load.
+  VRAM during load. Values above ~4 GiB are clamped: the pool is a single
+  NIXL registration, and the backend rejects one larger than
+  `CUOBJ_MAX_MEMORY_REG_SIZE` (4 GiB, or 4 GiB - 64 KiB since CUDA 13.3).
 
 A group is never split across transfers and a tensor is never split
 across groups, so a tensor larger than the target simply gets a group of
