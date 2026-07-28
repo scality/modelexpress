@@ -257,33 +257,52 @@ def _headers(count, tensors_per_shard=4, tensor_size=1024, dtype="U8"):
 
 
 class _FakeManager:
-    """Stand-in for ObjTransferManager recording submit/wait ordering.
+    """Stand-in for ObjTransferManager recording pool and submit/wait ordering.
 
-    Records an `events` list of ("submit", handle, ranges) / ("wait", handle) so a
-    test can assert not just what was requested but when it was awaited relative
-    to other submissions.
+    Records an `events` list of ("submit", handle, key, offset, size, pool_offset)
+    and ("wait", handle) so a test can assert not just what was requested but when
+    it was awaited relative to other submissions -- and, for the pooled path, which
+    region of the pool each transfer landed in.
     """
 
     def __init__(self):
         self.events = []
         self._seq = 0
         self._ranges = {}
+        self.pool = None
+        self.pool_opens = 0
+        self.registered_objects = None
+        self.closed = False
 
-    def submit_objects(self, jobs, device):
+    # -- pooled path ---------------------------------------------------------
+
+    def open_pool(self, pool_bytes, device):
+        self.pool_opens += 1
+        self.pool = torch.zeros(pool_bytes, dtype=torch.uint8)
+        self.events.append(("open_pool", pool_bytes))
+
+    def register_objects(self, object_sizes):
+        self.registered_objects = dict(object_sizes)
+        self.events.append(("register_objects", len(object_sizes)))
+
+    def submit_pooled(self, object_key, obj_offset, size, pool_offset):
         self._seq += 1
         handle = _FakeHandle(f"h{self._seq}")
-        ranges = tuple((key, tuple(rs)) for key, rs in jobs)
-        self._ranges[handle.name] = ranges
-        self.events.append(("submit", handle.name, ranges))
+        self.events.append(
+            ("submit", handle.name, object_key, obj_offset, size, pool_offset)
+        )
+        self._ranges[handle.name] = (object_key, obj_offset, size, pool_offset)
         return handle
+
+    def close_pool(self):
+        self.closed = True
+        self.events.append(("close_pool",))
+
+    # -- shared --------------------------------------------------------------
 
     def wait_objects(self, handle):
         self.events.append(("wait", handle.name))
-        # One uint8 buffer per range, matching what the real manager returns.
-        return [
-            [torch.zeros(size, dtype=torch.uint8) for _off, size in rs]
-            for _key, rs in self._ranges[handle.name]
-        ]
+        return []
 
     def outstanding(self):
         """Handles submitted but not yet awaited."""
@@ -291,14 +310,19 @@ class _FakeManager:
         awaited = {e[1] for e in self.events if e[0] == "wait"}
         return [h for h in submitted if h not in awaited]
 
-    def submitted_ranges(self):
-        """[(key, offset, size), ...] in submission order."""
+    def submitted(self):
+        """[(key, obj_offset, size, pool_offset), ...] in submission order."""
         return [
-            (key, off, size)
+            (e[2], e[3], e[4], e[5]) for e in self.events if e[0] == "submit"
+        ]
+
+    def live_regions(self):
+        """Pool regions of transfers submitted but not yet awaited."""
+        awaited = {e[1] for e in self.events if e[0] == "wait"}
+        return [
+            (e[5], e[5] + e[4])
             for e in self.events
-            if e[0] == "submit"
-            for key, rs in e[2]
-            for off, size in rs
+            if e[0] == "submit" and e[1] not in awaited
         ]
 
 
@@ -533,10 +557,119 @@ class TestStagingBudget:
 # ---------------------------------------------------------------------------
 # Feed loop
 # ---------------------------------------------------------------------------
+# Pool ring allocator
+# ---------------------------------------------------------------------------
+
+
+class _FakeEvent:
+    """Stand-in for torch.cuda.Event with query() under test control."""
+
+    def __init__(self):
+        self.done = False
+        self.synchronized = False
+
+    def record(self):
+        pass
+
+    def query(self):
+        return self.done
+
+    def synchronize(self):
+        self.synchronized = True
+        self.done = True
+
+
+class TestPoolRing:
+    """Regions are reused only once their consumer has demonstrably finished."""
+
+    def _ring(self, size):
+        from modelexpress.obj_loader import _PoolRing
+        return _PoolRing(size)
+
+    def test_allocates_sequentially(self):
+        ring = self._ring(1000)
+        assert ring.alloc(300) == 0
+        assert ring.alloc(300) == 300
+        assert ring.alloc(300) == 600
+
+    def test_rejects_a_group_larger_than_the_pool(self):
+        ring = self._ring(100)
+        with pytest.raises(RuntimeError, match="exceeds"):
+            ring.alloc(101)
+
+    def test_blocks_on_in_flight_regions(self):
+        # Nothing consumed yet, so the ring cannot free anything itself.
+        ring = self._ring(1000)
+        ring.alloc(600)
+        ring.alloc(400)
+        assert ring.alloc(100) is None, "handed out memory still being written"
+
+    def test_reclaims_a_completed_region_without_waiting(self):
+        # The fast path: the consumer has finished, so the region is reclaimed by
+        # polling the event and the allocation wraps into it.
+        ring = self._ring(1000)
+        first = ring.alloc(600)
+        ring.alloc(400)
+        with patch("torch.cuda.Event", _FakeEvent):
+            ring.consumed(first)
+        event = ring._regions[0][2]
+        event.done = True
+
+        assert ring.alloc(100) == 0, "should wrap into the reclaimed region"
+        assert not event.synchronized, "should poll, not block, when already done"
+
+    def test_waits_rather_than_failing_when_only_consumed_regions_block(self):
+        # A consumed region whose event has not fired must be waited on, not
+        # reported as a failure: the caller has nothing left to drain.
+        ring = self._ring(1000)
+        first = ring.alloc(1000)
+        with patch("torch.cuda.Event", _FakeEvent):
+            ring.consumed(first)
+        event = ring._regions[0][2]
+        assert ring.alloc(500) == 0
+        assert event.synchronized, "should have waited on the consumer's copies"
+
+    def test_regions_never_overlap(self):
+        # Drive a long sequence of varied sizes and assert the invariant that
+        # matters: no live region ever overlaps another.
+        import random
+
+        rnd = random.Random(1234)
+        ring = self._ring(4096)
+        live = []
+        with patch("torch.cuda.Event", _FakeEvent):
+            for _ in range(400):
+                size = rnd.randint(1, 900)
+                off = ring.alloc(size)
+                if off is None:
+                    if not live:
+                        continue
+                    done_off = live.pop(0)[0]
+                    ring.consumed(done_off)
+                    for r in ring._regions:
+                        if r[0] == done_off and r[2] is not None:
+                            r[2].done = True
+                    continue
+                for lo, hi in live:
+                    assert off >= hi or off + size <= lo, (
+                        f"region [{off},{off + size}) overlaps live [{lo},{hi})"
+                    )
+                live.append((off, off + size))
+                if len(live) > 3:
+                    done_off = live.pop(0)[0]
+                    ring.consumed(done_off)
+                    for r in ring._regions:
+                        if r[0] == done_off and r[2] is not None:
+                            r[2].done = True
+
+
+# ---------------------------------------------------------------------------
+# Feed loop
+# ---------------------------------------------------------------------------
 
 
 class TestFeedLoop:
-    """Posts ahead up to the staging budget, yields each group as it lands."""
+    """One pooled transfer per group; the pool is registered once."""
 
     def _run(self, loader, headers, budget_bytes, group_mb="64", **kw):
         with patch("modelexpress.obj_loader.is_obj_available", return_value=True), \
@@ -550,26 +683,38 @@ class TestFeedLoop:
              ), \
              patch.dict("os.environ", {"MX_OBJ_GROUP_MB": group_mb}), \
              patch("torch.cuda.current_device", return_value=0), \
+             patch("torch.cuda.Event", _FakeEvent), \
              patch("torch.device", return_value=None):
             return list(loader.load_iter("org/model", "", use_tqdm=False, **kw))
 
-    def test_one_transfer_per_group_not_per_tensor(self):
+    def test_pool_opened_once_and_keys_registered_once(self):
         manager = _FakeManager()
         loader = _loader(manager)
-        # 8 tensors of 1 MiB in one shard, 4 MiB groups -> 2 transfers, 8 tensors.
+        headers = _headers(3, tensors_per_shard=4, tensor_size=1024 * 1024)
+
+        self._run(loader, headers, budget_bytes=1 << 30, group_mb="4")
+
+        assert manager.pool_opens == 1, "the pool must be registered once per load"
+        assert len(manager.registered_objects) == 3, "one devId per shard object"
+        assert manager.closed, "the pool must be released"
+        # No per-transfer registration: submit_objects is never used on this path.
+        assert not any(e[0] == "register" for e in manager.events)
+
+    def test_one_transfer_per_group_into_distinct_pool_regions(self):
+        manager = _FakeManager()
+        loader = _loader(manager)
         headers = _headers(1, tensors_per_shard=8, tensor_size=1024 * 1024)
 
         out = self._run(loader, headers, budget_bytes=1 << 30, group_mb="4")
 
-        assert len(out) == 8, "every tensor must still be delivered"
-        submits = [e for e in manager.events if e[0] == "submit"]
-        assert len(submits) == 2, "expected one transfer per group"
-        # Each transfer is a single contiguous range covering the whole group.
-        for _kind, _h, ranges in submits:
-            assert len(ranges) == 1 and len(ranges[0][1]) == 1
-            assert ranges[0][1][0][1] == 4 * 1024 * 1024
+        assert len(out) == 8
+        submitted = manager.submitted()
+        assert len(submitted) == 2, "expected one transfer per group"
+        # Regions must not overlap while both are outstanding.
+        (_, _, s0, p0), (_, _, s1, p1) = submitted
+        assert p1 >= p0 + s0 or p0 >= p1 + s1
 
-    def test_yields_named_typed_tensors_from_a_shared_buffer(self):
+    def test_yields_named_typed_tensors_from_the_pool(self):
         manager = _FakeManager()
         loader = _loader(manager)
         headers = {
@@ -578,47 +723,47 @@ class TestFeedLoop:
                 "w2": {"offset": 40, "size": 16, "dtype": "F32", "shape": [4]},
             }
         }
-        out = self._run(loader, headers, budget_bytes=1 << 30)
+        out = self._run(loader, headers, budget_bytes=1 << 20)
 
         assert [n for n, _ in out] == ["w1", "w2"]
         assert [list(t.shape) for _, t in out] == [[4, 2], [4]]
         assert all(t.dtype == torch.float32 for _, t in out)
-        # One transfer covered both, so both views share one storage.
-        assert len({t.untyped_storage().data_ptr() for _, t in out}) == 1
+        # Both are views of the pool, not copies.
+        pool_ptr = manager.pool.data_ptr()
+        pool_end = pool_ptr + manager.pool.numel()
+        for _, t in out:
+            assert pool_ptr <= t.data_ptr() < pool_end
 
     def test_posts_ahead_before_awaiting(self):
         manager = _FakeManager()
         loader = _loader(manager)
-        # 5 groups of 1 MiB each (1 MiB target), budget far above -> all posted.
         headers = _headers(1, tensors_per_shard=5, tensor_size=1024 * 1024)
 
         self._run(loader, headers, budget_bytes=1 << 30, group_mb="1")
 
-        kinds = [e[0] for e in manager.events]
-        first_wait = kinds.index("wait")
-        assert first_wait == 5, (
+        kinds = [e[0] for e in manager.events if e[0] in ("submit", "wait")]
+        assert kinds.index("wait") == 5, (
             f"expected all 5 submits before the first wait, got {kinds}"
         )
 
-    def test_budget_bounds_outstanding_bytes(self):
+    def test_pool_bounds_outstanding_bytes(self):
         manager = _FakeManager()
         loader = _loader(manager)
         size = 1024 * 1024
         headers = _headers(1, tensors_per_shard=8, tensor_size=size)
 
-        peak = 0
-        real_submit = manager.submit_objects
-
-        def tracking_submit(jobs, device):
-            nonlocal peak
-            handle = real_submit(jobs, device)
-            peak = max(peak, len(manager.outstanding()))
-            return handle
-
-        manager.submit_objects = tracking_submit
         self._run(loader, headers, budget_bytes=3 * size, group_mb="1")
 
-        assert peak <= 3, f"outstanding transfers peaked at {peak}, budget allowed 3"
+        # Peak live pool bytes must never exceed the pool.
+        peak = 0
+        live = {}
+        for e in manager.events:
+            if e[0] == "submit":
+                live[e[1]] = e[4]
+            elif e[0] == "wait":
+                live.pop(e[1], None)
+            peak = max(peak, sum(live.values()))
+        assert peak <= 3 * size, f"outstanding peaked at {peak}, pool was {3 * size}"
 
     def test_oversized_group_is_still_admitted(self):
         manager = _FakeManager()
@@ -628,11 +773,12 @@ class TestFeedLoop:
                 "big": {"offset": 8, "size": 4096, "dtype": "U8", "shape": [4096]}
             }
         }
-        out = self._run(loader, headers, budget_bytes=16)
+        # Budget exactly the group: the ring must admit it rather than deadlock.
+        out = self._run(loader, headers, budget_bytes=4096)
 
         assert [n for n, _ in out] == ["big"]
 
-    def test_drains_everything_on_abandonment(self):
+    def test_drains_and_closes_on_abandonment(self):
         manager = _FakeManager()
         loader = _loader(manager)
         headers = _headers(1, tensors_per_shard=5, tensor_size=1024 * 1024)
@@ -646,9 +792,11 @@ class TestFeedLoop:
              patch.object(loader, "_resolve_staging_budget", return_value=1 << 30), \
              patch.dict("os.environ", {"MX_OBJ_GROUP_MB": "1"}), \
              patch("torch.cuda.current_device", return_value=0), \
+             patch("torch.cuda.Event", _FakeEvent), \
              patch("torch.device", return_value=None):
             it = loader.load_iter("org/model", "", use_tqdm=False)
             next(it)
             it.close()
 
         assert manager.outstanding() == [], "posted transfers were left unawaited"
+        assert manager.closed, "the pool must be released even on abandonment"

@@ -123,12 +123,16 @@ def is_obj_available() -> bool:
 
 @dataclass
 class ObjBatchHandle:
-    """A posted-but-not-yet-awaited OBJ batch transfer.
+    """A posted-but-not-yet-awaited OBJ transfer.
 
-    Holds the destination buffers plus the NIXL state that must be released
-    once the transfer completes. Produced by ``submit_objects``, consumed by
-    ``wait_objects``; a handle must be awaited exactly once, since awaiting
-    deregisters its memory.
+    Produced by ``submit_objects`` or ``submit_pooled``, consumed by
+    ``wait_objects`` exactly once.
+
+    ``obj_descs``/``vram_descs`` are the registrations to release on completion,
+    and are None for a pooled transfer: the pool is registered once for the whole
+    load, so releasing per transfer is exactly the cost pooling exists to avoid.
+    ``buffers`` is likewise empty for a pooled transfer, whose destination the
+    caller already knows as an offset into the pool.
     """
 
     buffers: list[list[torch.Tensor]]
@@ -163,6 +167,12 @@ class ObjTransferManager:
         self._agent: Any = None
         # Monotonic OBJ devId source; see submit_objects for why it must not reset.
         self._next_obj_dev_id = 0
+        # Pooled path state: one registered staging buffer plus the object-key
+        # table, both established once per load. See open_pool().
+        self._pool: torch.Tensor | None = None
+        self._pool_reg: Any = None
+        self._obj_reg: Any = None
+        self._obj_dev_ids: dict[str, int] = {}
 
     def __enter__(self) -> ObjTransferManager:
         self.initialize()
@@ -257,6 +267,120 @@ class ObjTransferManager:
             the same order as that job's range_list.
         """
         return self.wait_objects(self.submit_objects(jobs, device))
+
+    # ------------------------------------------------------------------
+    # Pooled path: register once, transfer many
+    # ------------------------------------------------------------------
+
+    @property
+    def pool(self) -> torch.Tensor | None:
+        """The registered staging pool, or None until open_pool()."""
+        return self._pool
+
+    def open_pool(self, pool_bytes: int, device: torch.device) -> None:
+        """Allocate one staging buffer and register it once for the whole load.
+
+        Registration pins pages and costs time proportional to the bytes pinned --
+        measured at ~0.076 ms/MiB on an H100 with four rails. Registering each
+        transfer's destination separately therefore pins the entire model over the
+        course of a load: 51.1 GiB and 3.98s of a 4.47s Gemma-3-27B load. Pinning
+        one pool instead makes that a constant.
+
+        NIXL keeps registration and transfer descriptors separate, so a transfer may
+        name any sub-range of registered memory; the DC token client resolves each
+        request against the registration containing it. That is what makes reuse
+        possible without re-registering.
+        """
+        if self._agent is None:
+            raise RuntimeError("OBJ agent not initialized")
+        if self._pool is not None:
+            raise RuntimeError("OBJ staging pool already open")
+
+        self._pool = torch.empty(pool_bytes, dtype=torch.uint8, device=device)
+        started = time.perf_counter()
+        self._pool_reg = self._agent.register_memory(
+            [(self._pool.data_ptr(), pool_bytes, self._device_id, "")], "VRAM"
+        )
+        logger.info(
+            "OBJ staging pool: %.1f GiB registered once in %.0fms",
+            pool_bytes / (1024 ** 3), 1000 * (time.perf_counter() - started),
+        )
+
+    def register_objects(self, object_sizes: dict[str, int]) -> None:
+        """Seat the object-key table once, one devId per key.
+
+        The backend resolves a transfer's object key from its remote descriptor's
+        devId, so the key must be registered before any transfer naming it. For an
+        OBJ segment that registration is only a map insert -- no pinning, no
+        network -- so doing every key up front is effectively free and removes the
+        per-transfer OBJ registration entirely.
+        """
+        if self._agent is None:
+            raise RuntimeError("OBJ agent not initialized")
+        if self._obj_reg is not None:
+            raise RuntimeError("OBJ keys already registered")
+
+        regions = []
+        for key, size in object_sizes.items():
+            dev_id = self._next_obj_dev_id
+            self._next_obj_dev_id += 1
+            self._obj_dev_ids[key] = dev_id
+            # len is unused by the OBJ branch of registerMem, which records only
+            # devId -> key; pass the highest byte we will read so it is not a lie.
+            regions.append((0, max(1, size), dev_id, key))
+        self._obj_reg = self._agent.register_memory(regions, "OBJ")
+        logger.info("OBJ keys registered: %d object(s)", len(regions))
+
+    def submit_pooled(
+        self, object_key: str, obj_offset: int, size: int, pool_offset: int
+    ) -> ObjBatchHandle:
+        """Post one range into the pool at pool_offset, without registering.
+
+        Both descriptor lists are built directly rather than derived from a
+        registration, which is what keeps this off the pinning path.
+        """
+        if self._agent is None:
+            raise RuntimeError("OBJ agent not initialized")
+        if self._pool is None:
+            raise RuntimeError("OBJ staging pool not open")
+        dev_id = self._obj_dev_ids.get(object_key)
+        if dev_id is None:
+            raise RuntimeError(f"object key '{object_key}' was not registered")
+
+        vram_descs = self._agent.get_xfer_descs(
+            [(self._pool.data_ptr() + pool_offset, size, self._device_id)], "VRAM"
+        )
+        obj_descs = self._agent.get_xfer_descs(
+            [(obj_offset, size, dev_id)], "OBJ"
+        )
+        xfer = self._agent.initialize_xfer(
+            "READ", vram_descs, obj_descs, self._agent.name
+        )
+        state = self._agent.transfer(xfer)
+        if state == "ERR":
+            self._agent.release_xfer_handle(xfer)
+            raise RuntimeError(f"OBJ transfer failed for key '{object_key}'")
+
+        return ObjBatchHandle(
+            buffers=[],
+            label=f"key '{object_key}' +{obj_offset}",
+            descriptors=1,
+            posted_at=time.perf_counter(),
+            xfer=xfer,
+            obj_descs=None,
+            vram_descs=None,
+        )
+
+    def close_pool(self) -> None:
+        """Release the pool registration and the buffer."""
+        if self._agent is not None and self._pool_reg is not None:
+            self._agent.deregister_memory(self._pool_reg)
+        if self._agent is not None and self._obj_reg is not None:
+            self._agent.deregister_memory(self._obj_reg)
+        self._pool_reg = None
+        self._obj_reg = None
+        self._pool = None
+        self._obj_dev_ids = {}
 
     def submit_objects(
         self,
@@ -378,7 +502,10 @@ class ObjTransferManager:
                     spins = 0
         finally:
             self._agent.release_xfer_handle(handle.xfer)
-            self._free_nixl_memory(handle.obj_descs, handle.vram_descs)
+            # None for a pooled transfer: the pool stays registered for the whole
+            # load, which is the entire point of pooling.
+            if handle.obj_descs is not None or handle.vram_descs is not None:
+                self._free_nixl_memory(handle.obj_descs, handle.vram_descs)
 
         return handle.buffers
 

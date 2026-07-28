@@ -29,6 +29,7 @@ import os
 import re
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Iterator, NamedTuple
 
@@ -97,6 +98,85 @@ class _PlannedGroup(NamedTuple):
     offset: int
     size: int
     members: list[_PlannedTensor]
+
+
+class _PoolRing:
+    """Circular allocator over the registered staging pool.
+
+    Groups run from a few KB to several GiB, so fixed-size slots are unusable: slots
+    big enough for the largest would give one or two of them and destroy pipelining.
+    Allocation is therefore variable-size, at the head, wrapping to 0 when the tail
+    of the pool cannot hold the next group.
+
+    Reclaim is guarded by a CUDA event, and that guard is load-bearing. The NIC
+    writes into a region outside any CUDA stream, while the consumer's copy out of
+    it is enqueued on the current stream. Reusing a region before that copy has
+    executed corrupts weights *silently* -- no fault, no error, just wrong numbers.
+    So a region stays occupied until an event recorded after its tensors were handed
+    over reports complete.
+    """
+
+    def __init__(self, size: int):
+        self._size = size
+        self._head = 0
+        # (offset, end, event) in allocation order. event is None while the
+        # transfer is still in flight or being consumed.
+        self._regions: deque[list] = deque()
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def _free(self, offset: int, size: int) -> bool:
+        end = offset + size
+        return all(end <= o or offset >= e for o, e, _ in self._regions)
+
+    def _reclaim(self) -> None:
+        """Drop regions whose consumer has demonstrably finished with them."""
+        while self._regions:
+            offset, end, event = self._regions[0]
+            if event is None or not event.query():
+                return
+            self._regions.popleft()
+
+    def alloc(self, size: int) -> int | None:
+        """Reserve `size` bytes, or None if only in-flight regions are in the way.
+
+        None means the caller must drain a transfer and retry; everything this can
+        resolve on its own -- completed events, and waiting on consumed regions --
+        it resolves first.
+        """
+        if size > self._size:
+            raise RuntimeError(
+                f"group of {size} bytes exceeds the {self._size}-byte staging pool"
+            )
+        self._reclaim()
+        while True:
+            for candidate in (self._head, 0):
+                if candidate + size <= self._size and self._free(candidate, size):
+                    self._head = candidate + size
+                    self._regions.append([candidate, candidate + size, None])
+                    return candidate
+            # Nothing fits. If the oldest region is merely waiting on its consumer's
+            # copy, wait for it rather than reporting failure.
+            if self._regions and self._regions[0][2] is not None:
+                self._regions[0][2].synchronize()
+                self._regions.popleft()
+                continue
+            return None
+
+    def consumed(self, offset: int) -> None:
+        """Mark a region handed to the consumer, recording the reuse barrier.
+
+        Called once control returns from yielding the region's tensors, so the event
+        follows every copy the consumer enqueued for them.
+        """
+        event = torch.cuda.Event()
+        event.record()
+        for region in self._regions:
+            if region[0] == offset:
+                region[2] = event
+                return
 
 
 def _element_size(dtype: torch.dtype) -> int:
@@ -184,7 +264,7 @@ class MxObjLoader:
                 unit="tensor",
             )
 
-        # One transfer per group, posted as fast as the staging budget allows.
+        # One transfer per group into a pool registered once for the whole load.
         #
         # The transfer handle is the unit of completion -- NIXL reports DONE only
         # once every request in a handle has landed, with no per-request status --
@@ -193,36 +273,35 @@ class MxObjLoader:
         #
         # Concurrency is not managed here. The backend cuts each descriptor into
         # requests and caps how many run at once, so posting generously just keeps
-        # its queue fed; all this loop bounds is VRAM committed to groups that have
-        # been requested but not yet consumed.
+        # its queue fed; what this loop bounds is the pool, and therefore how much
+        # VRAM is committed to groups requested but not yet consumed.
         #
         # Entries are popped before being drained, so a failure mid-drain cannot
         # double-await one; whatever is still queued is drained by the finally.
-        inflight: list[tuple[ObjBatchHandle, _PlannedGroup]] = []
-        staged = 0
+        self._obj_manager.open_pool(budget, device)
+        self._obj_manager.register_objects(
+            {key: end for key, end in self._object_extents(plan).items()}
+        )
+        ring = _PoolRing(budget)
+        inflight: list[tuple[ObjBatchHandle, _PlannedGroup, int]] = []
         try:
             for group in plan:
-                # Make room first, but always admit one group so an oversized one
-                # cannot deadlock against its own budget.
-                while inflight and staged + group.size > budget:
-                    handle, done = inflight.pop(0)
-                    staged -= done.size
-                    yield from self._take(handle, done)
-                    if pbar is not None:
-                        pbar.update(len(done.members))
+                offset = ring.alloc(group.size)
+                while offset is None:
+                    # Only in-flight regions can be in the way; the ring already
+                    # waited on anything merely pending its consumer.
+                    if not inflight:
+                        raise RuntimeError("staging pool deadlock: nothing to drain")
+                    yield from self._drain(inflight.pop(0), ring, pbar)
+                    offset = ring.alloc(group.size)
 
-                handle = self._obj_manager.submit_objects(
-                    [(group.object_key, [(group.offset, group.size)])], device
+                handle = self._obj_manager.submit_pooled(
+                    group.object_key, group.offset, group.size, offset
                 )
-                inflight.append((handle, group))
-                staged += group.size
+                inflight.append((handle, group, offset))
 
             while inflight:
-                handle, done = inflight.pop(0)
-                staged -= done.size
-                yield from self._take(handle, done)
-                if pbar is not None:
-                    pbar.update(len(done.members))
+                yield from self._drain(inflight.pop(0), ring, pbar)
 
             logger.info(
                 "OBJ load complete in %.2fs (%d tensors in %d transfers)",
@@ -230,14 +309,15 @@ class MxObjLoader:
             )
         finally:
             # A consumer that abandons the iterator (or an error mid-yield) can
-            # leave posted transfers unawaited. Their memory is still registered
-            # and the server may still be writing into it, so they must be awaited
-            # rather than simply dropped.
-            for pending, _group in inflight:
+            # leave posted transfers unawaited. The server may still be writing into
+            # the pool, so they must be awaited before it is released rather than
+            # simply dropped.
+            for pending, _group, _offset in inflight:
                 try:
                     self._obj_manager.wait_objects(pending)
                 except Exception as e:
                     logger.warning("Abandoned OBJ transfer failed to drain: %s", e)
+            self._obj_manager.close_pool()
             if pbar is not None:
                 pbar.close()
 
@@ -499,23 +579,41 @@ class MxObjLoader:
         )
         return groups
 
-    def _take(
-        self, handle: ObjBatchHandle, group: _PlannedGroup
-    ) -> Iterator[tuple[str, torch.Tensor]]:
-        """Await one posted group and yield its tensors as named, typed views.
+    @staticmethod
+    def _object_extents(plan: list[_PlannedGroup]) -> dict[str, int]:
+        """Highest byte read from each object, for the one-time key registration."""
+        extents: dict[str, int] = {}
+        for g in plan:
+            end = g.offset + g.size
+            if end > extents.get(g.object_key, 0):
+                extents[g.object_key] = end
+        return extents
 
-        Every member is a slice of the one staging buffer, so no copy is made and
-        the buffer lives until the consumer has released the last view from it.
-        The manager's own reference is dropped so that is the only thing keeping
-        it alive.
+    def _drain(
+        self,
+        inflight: tuple[ObjBatchHandle, _PlannedGroup, int],
+        ring: _PoolRing,
+        pbar,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Await one posted group, yield its tensors, then free its pool region.
+
+        Members are slices of the pool, so nothing is copied on our side. The region
+        is released only after control returns from the last yield, at which point an
+        event records the consumer's copies -- see _PoolRing for why reusing it any
+        earlier corrupts weights without any visible error.
         """
-        buffers = self._obj_manager.wait_objects(handle)
-        raw = buffers[0][0]
-        handle.buffers = []
+        handle, group, offset = inflight
+        self._obj_manager.wait_objects(handle)
+        pool = self._obj_manager.pool
 
         for m in group.members:
-            chunk = raw[m.rel_offset:m.rel_offset + m.size]
+            start = offset + m.rel_offset
+            chunk = pool[start:start + m.size]
             yield m.name, chunk.view(m.dtype).reshape(m.shape)
+
+        ring.consumed(offset)
+        if pbar is not None:
+            pbar.update(len(group.members))
 
     def shutdown(self) -> None:
         """Release OBJ resources."""
