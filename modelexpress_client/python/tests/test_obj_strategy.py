@@ -113,22 +113,62 @@ class TestObjStrategyIntegration:
         mock_obj.shutdown.assert_called_once()
 
     @patch("modelexpress.obj_loader.MxObjLoader")
-    def test_obj_apply_weight_iter_failure_is_mutated(self, mock_obj_cls):
+    def test_obj_failure_before_any_tensor_is_not_mutated(self, mock_obj_cls):
+        """Nothing delivered means the model is untouched, so no rebuild.
+
+        This is the source-unreachable case: the header read 404s and the
+        generator raises on its first pull. Reporting mutated here cost a full
+        51 GiB model rebuild, which is what ran the GPU out of memory.
+        """
         from modelexpress.load_strategy.obj_strategy import ObjStrategy
 
+        def never_yields():
+            raise RuntimeError("could not read safetensors headers")
+            yield  # pragma: no cover - makes this a generator
+
         mock_obj = MagicMock()
-        mock_obj.load_iter.return_value = iter([("w", torch.zeros(1))])
+        mock_obj.load_iter.return_value = never_yields()
         mock_obj_cls.return_value = mock_obj
 
         ctx = _make_context()
-        ctx.adapter.apply_weight_iter = MagicMock(side_effect=RuntimeError("partial load"))
+        # A real adapter consumes the iterator; the failure surfaces from it.
+        ctx.adapter.apply_weight_iter = MagicMock(
+            side_effect=lambda result, it: [_ for _ in it]
+        )
         ctx.model_config.model = "test-model"
         ctx.model_config.model_weights = "bucket/prefix"
 
-        with pytest.raises(StrategyFailed, match="partial load") as exc:
+        with pytest.raises(StrategyFailed, match="safetensors headers") as exc:
             ObjStrategy().load(MagicMock(), ctx)
 
-        assert exc.value.mutated is True
+        assert exc.value.mutated is False, "an untouched model must not be rebuilt"
+        mock_obj.shutdown.assert_called_once()
+
+    @patch("modelexpress.obj_loader.MxObjLoader")
+    def test_obj_failure_after_some_tensors_is_mutated(self, mock_obj_cls):
+        """A load that died part-way through really did write to the model."""
+        from modelexpress.load_strategy.obj_strategy import ObjStrategy
+
+        def dies_midway():
+            yield ("w0", torch.zeros(1))
+            yield ("w1", torch.zeros(1))
+            raise RuntimeError("transfer died mid-stream")
+
+        mock_obj = MagicMock()
+        mock_obj.load_iter.return_value = dies_midway()
+        mock_obj_cls.return_value = mock_obj
+
+        ctx = _make_context()
+        ctx.adapter.apply_weight_iter = MagicMock(
+            side_effect=lambda result, it: [_ for _ in it]
+        )
+        ctx.model_config.model = "test-model"
+        ctx.model_config.model_weights = "bucket/prefix"
+
+        with pytest.raises(StrategyFailed, match="mid-stream") as exc:
+            ObjStrategy().load(MagicMock(), ctx)
+
+        assert exc.value.mutated is True, "a half-written model must be rebuilt"
         mock_obj.shutdown.assert_called_once()
 
 

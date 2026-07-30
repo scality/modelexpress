@@ -9,7 +9,7 @@ import logging
 import os
 import uuid
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Iterator
 
 import torch
 import torch.nn as nn
@@ -45,6 +45,12 @@ class LoadStrategy(ABC):
       - raise StrategyFailed(mutated=False) for expected fallback paths
       - raise StrategyFailed(mutated=True) after mutating the model
       - reserve unexpected errors for rare defensive fallback in the chain
+
+    ``mutated`` must be reported, not assumed. It is what makes the chain discard
+    the model and build a replacement, so claiming it when nothing was written
+    costs a second full copy of the model in device memory for no reason. Wrap the
+    weight iterator in WeightDelivery and read ``.mutated`` from it; see that class
+    for why a hardcoded True was expensive.
     """
 
     name: str
@@ -103,6 +109,45 @@ def _as_load_result(result_or_model: LoadResult | nn.Module) -> LoadResult:
     if isinstance(result_or_model, LoadResult):
         return result_or_model
     return LoadResult(value=result_or_model, model=result_or_model)
+
+
+class WeightDelivery:
+    """Wraps a weight iterator and records how many tensors reached the engine.
+
+    A strategy that fails has to tell the chain whether it touched the model,
+    because saying yes is expensive: the chain discards the model and builds a
+    replacement, and on a large model that means two full copies resident at once.
+    Hardcoding "yes" cost a 51 GiB rebuild on a run whose weight source 404'd
+    before a single tensor was read, and that rebuild is what ran the GPU out of
+    memory.
+
+    Counting deliveries answers it from what happened. Nothing delivered means the
+    engine's weight loader was never handed a tensor, so the model is still exactly
+    what initialize_model produced and the next strategy can use it as-is -- it
+    overwrites every parameter anyway.
+
+    Deliberately conservative in the other direction: a tensor pulled and then
+    dropped without being copied still counts, because from here we cannot tell.
+    Over-reporting costs a rebuild; under-reporting would hand the next strategy a
+    half-written model.
+    """
+
+    def __init__(self, source: Iterator[tuple[str, torch.Tensor]]):
+        self._source = iter(source)
+        self.count = 0
+
+    def __iter__(self) -> WeightDelivery:
+        return self
+
+    def __next__(self) -> tuple[str, torch.Tensor]:
+        item = next(self._source)
+        self.count += 1
+        return item
+
+    @property
+    def mutated(self) -> bool:
+        """Whether the model may have been written to."""
+        return self.count > 0
 
 
 def _metadata_publication_configured(ctx: LoadContext) -> bool:

@@ -244,24 +244,56 @@ class TestModelStreamerLoad:
         mock_register.assert_not_called()
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_apply_weight_iter_failure_is_mutated(self, mock_register):
+    def test_failure_before_any_tensor_is_not_mutated(self, mock_register):
+        """Nothing delivered means the model is untouched, so no rebuild."""
         model = MagicMock()
         adapter = _FakeAdapter()
-        adapter.apply_weight_iter = MagicMock(side_effect=RuntimeError("partial load"))
+        adapter.apply_weight_iter = MagicMock(
+            side_effect=lambda result, it: [_ for _ in it]
+        )
         ctx = _make_load_context(adapter=adapter)
         strategy = self._make_strategy()
+
+        def never_yields():
+            raise RuntimeError("partial load")
+            yield  # pragma: no cover - makes this a generator
 
         with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
             with patch(
                 "modelexpress.load_strategy.model_streamer_strategy."
                 "ModelStreamerStrategy._stream_weights",
-                return_value=iter([("layer.0.weight", torch.randn(4, 4))]),
+                return_value=never_yields(),
             ):
                 with pytest.raises(StrategyFailed, match="partial load") as exc:
                     strategy.load(model, ctx)
 
-        assert exc.value.mutated is True
+        assert exc.value.mutated is False, "an untouched model must not be rebuilt"
         mock_register.assert_not_called()
+
+    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
+    def test_failure_after_some_tensors_is_mutated(self, mock_register):
+        model = MagicMock()
+        adapter = _FakeAdapter()
+        adapter.apply_weight_iter = MagicMock(
+            side_effect=lambda result, it: [_ for _ in it]
+        )
+        ctx = _make_load_context(adapter=adapter)
+        strategy = self._make_strategy()
+
+        def dies_midway():
+            yield ("layer.0.weight", torch.randn(4, 4))
+            raise RuntimeError("partial load")
+
+        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
+            with patch(
+                "modelexpress.load_strategy.model_streamer_strategy."
+                "ModelStreamerStrategy._stream_weights",
+                return_value=dies_midway(),
+            ):
+                with pytest.raises(StrategyFailed, match="partial load") as exc:
+                    strategy.load(model, ctx)
+
+        assert exc.value.mutated is True, "a half-written model must be rebuilt"
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
     def test_after_weight_iter_failure_is_mutated(self, mock_register):

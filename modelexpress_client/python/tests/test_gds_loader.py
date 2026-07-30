@@ -277,23 +277,55 @@ class TestGdsStrategyIntegration:
 
     @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
     @patch("modelexpress.gds_loader.MxGdsLoader")
-    def test_gds_apply_weight_iter_failure_is_mutated(self, mock_gds_cls, _mock_avail):
+    def test_gds_failure_before_any_tensor_is_not_mutated(self, mock_gds_cls, _mock_avail):
+        """Nothing delivered means the model is untouched, so no rebuild."""
         from modelexpress.load_strategy.gds_strategy import GdsStrategy
 
+        def never_yields():
+            raise RuntimeError("partial load")
+            yield  # pragma: no cover - makes this a generator
+
         mock_gds = MagicMock()
-        mock_gds.load_iter.return_value = iter([("w", torch.zeros(1))])
+        mock_gds.load_iter.return_value = never_yields()
         mock_gds_cls.return_value = mock_gds
 
         ctx = self._make_context()
-        ctx.adapter.apply_weight_iter = MagicMock(side_effect=RuntimeError("partial load"))
+        ctx.adapter.apply_weight_iter = MagicMock(
+            side_effect=lambda result, it: [_ for _ in it]
+        )
         ctx.model_config.model = "test-model"
 
         strategy = GdsStrategy()
         with pytest.raises(StrategyFailed, match="partial load") as exc:
             strategy.load(MagicMock(), ctx)
 
-        assert exc.value.mutated is True
+        assert exc.value.mutated is False, "an untouched model must not be rebuilt"
         mock_gds.shutdown.assert_called_once()
+
+    @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
+    @patch("modelexpress.gds_loader.MxGdsLoader")
+    def test_gds_failure_after_some_tensors_is_mutated(self, mock_gds_cls, _mock_avail):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
+
+        def dies_midway():
+            yield ("w0", torch.zeros(1))
+            raise RuntimeError("partial load")
+
+        mock_gds = MagicMock()
+        mock_gds.load_iter.return_value = dies_midway()
+        mock_gds_cls.return_value = mock_gds
+
+        ctx = self._make_context()
+        ctx.adapter.apply_weight_iter = MagicMock(
+            side_effect=lambda result, it: [_ for _ in it]
+        )
+        ctx.model_config.model = "test-model"
+
+        strategy = GdsStrategy()
+        with pytest.raises(StrategyFailed, match="partial load") as exc:
+            strategy.load(MagicMock(), ctx)
+
+        assert exc.value.mutated is True, "a half-written model must be rebuilt"
 
     @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
     @patch("modelexpress.gds_loader.MxGdsLoader")

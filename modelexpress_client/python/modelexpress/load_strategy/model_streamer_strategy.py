@@ -18,7 +18,13 @@ from typing import Iterator
 import torch
 
 from ..adapter import EngineAdapter, StrategyFailed
-from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
+from .base import (
+    LoadContext,
+    LoadStrategy,
+    WeightDelivery,
+    _as_load_result,
+    register_tensors,
+)
 from .context import LoadResult
 
 logger = logging.getLogger("modelexpress.strategy_model_streamer")
@@ -81,15 +87,20 @@ class ModelStreamerStrategy(LoadStrategy):
             )
             raise StrategyFailed(str(e), mutated=False) from e
 
+        delivery = WeightDelivery(weights_iter)
+        # Post-load processing rewrites parameters (quantisation prep), so
+        # entering it counts as mutation even if no tensor was delivered.
+        post_load_started = False
         try:
-            result = ctx.adapter.apply_weight_iter(result, weights_iter)
+            result = ctx.adapter.apply_weight_iter(result, delivery)
             logger.info(f"[Worker {ctx.global_rank}] Model streamer weight loading complete")
+            post_load_started = True
             result = ctx.adapter.after_weight_iter_load(result)
         except Exception as e:
             logger.warning(
                 f"[Worker {ctx.global_rank}] Model streamer loading failed, falling through: {e}"
             )
-            raise StrategyFailed(str(e), mutated=True) from e
+            raise StrategyFailed(str(e), mutated=delivery.mutated or post_load_started) from e
 
         register_tensors(result, ctx)
         return result
