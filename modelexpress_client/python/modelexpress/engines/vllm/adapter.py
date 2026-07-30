@@ -23,6 +23,32 @@ from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_
 
 logger = logging.getLogger("modelexpress.engines.vllm.adapter")
 
+
+def _release_model_storage(model) -> int:
+    """Empty a discarded model's parameter and buffer tensors. Returns bytes freed.
+
+    Deliberately not a reference-counting exercise. A model handed to us was created
+    by the caller, which still names it in a live frame, so dropping our own
+    references frees nothing and there is no cycle for gc to break. Replacing each
+    tensor's storage with an empty one releases the device memory regardless of who
+    still holds the module.
+
+    Safe because the caller only ever does this to a model it is replacing: the
+    emptied shell is discarded as soon as the new model is returned.
+    """
+    if model is None:
+        return 0
+    freed = 0
+    with torch.no_grad():
+        for tensors in (model.parameters(recurse=True), model.buffers(recurse=True)):
+            for tensor in tensors:
+                data = getattr(tensor, "data", None)
+                if data is None or data.numel() == 0:
+                    continue
+                freed += data.numel() * data.element_size()
+                tensor.data = torch.empty(0, dtype=data.dtype, device=data.device)
+    return freed
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -135,18 +161,26 @@ class VllmAdapter(EngineAdapter):
         old_value = result.value
         result.value = None
         result.model = None
+        # Free the discarded model's storage outright rather than dropping names and
+        # hoping. Clearing our own references cannot work: the caller that created
+        # the model still holds it in a live frame -- MxModelLoader.load_model does
+        # `model = LoadStrategyChain.run(model, ctx)`, so its `model` local points at
+        # the original for the whole call, as does run()'s parameter. Neither is
+        # garbage, so gc has nothing to collect and the 51 GiB stays committed while
+        # the replacement is allocated, which is an OOM on a 95 GiB card.
+        #
+        # Emptying the parameter and buffer tensors releases the memory whoever else
+        # is holding the module object. What survives is an empty shell that the
+        # caller is about to overwrite with our return value anyway.
+        freed = _release_model_storage(old_value)
         del old_value
-        # Collect before releasing: the frames of the failed attempt form reference
-        # cycles, so dropping the last name for the old model is not enough to free
-        # it, and empty_cache() only returns memory the allocator already considers
-        # unused. Without this the previous model is still resident while its
-        # replacement is built, which on a large model means running out of VRAM.
         gc.collect()
         torch.cuda.empty_cache()
         self._reset_compilation_state()
         logger.info(
-            "[Worker %s] Re-initializing vLLM model after failed strategy",
-            self.get_global_rank(),
+            "[Worker %s] Re-initializing vLLM model after failed strategy "
+            "(released %.1f GiB from the discarded one)",
+            self.get_global_rank(), freed / (1024 ** 3),
         )
         with self.target_device:
             model = initialize_model(

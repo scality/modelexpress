@@ -45,12 +45,13 @@ logger = logging.getLogger("modelexpress.load_strategy")
 def _release_failure_frames(exc: BaseException) -> None:
     """Release the frames a failed attempt's traceback is holding.
 
-    Not about log output. A traceback references every frame of the failed call,
-    each frame references its locals, and for a weight loader those locals include
-    the model and whatever buffers it was part-way through filling. Recovering from
-    the failure while that chain is intact means the old model's VRAM is still
-    committed when its replacement is allocated -- 51 GiB twice over on
-    Gemma-3-27B, which is an out-of-memory crash rather than a fallback.
+    Not about log output, and not what frees the model -- the caller names that in a
+    live frame, so it has to be released explicitly (see the adapter's
+    reinit_for_retry). What this reaches is everything else the failed attempt was
+    part-way through: staging buffers, partially-filled tensors, the generator frames
+    of a weight iterator abandoned mid-stream. Those are only reachable through the
+    traceback, so without this they survive until the next strategy has already
+    allocated its own.
 
     The message has already been logged by the caller; what is dropped here is the
     reference graph, not the diagnosis.
@@ -110,12 +111,12 @@ class LoadStrategyChain:
             for strategy in eligible:
                 logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
                 # Recovery runs AFTER the handler, never inside it. While an except
-                # block executes, the interpreter holds the exception, whose traceback
-                # references every frame of the failed attempt -- including the
-                # engine's weight-loading frame, which holds the model. Rebuilding
-                # there leaves the old model resident while its replacement is
-                # allocated, so a 51 GiB model needs 102 GiB and the fallback dies of
-                # OOM instead of recovering. Leaving the handler releases the frames.
+                # block executes the interpreter holds the exception, whose traceback
+                # pins every frame of the failed attempt and so everything those
+                # frames were working on. Leaving the handler first releases them, so
+                # the next strategy does not allocate on top of the last one's
+                # wreckage. The model itself is not freed this way -- the caller holds
+                # it in a live frame; the adapter releases its storage explicitly.
                 failure: tuple[str, bool] | None = None
                 try:
                     result = strategy.load(result, ctx)

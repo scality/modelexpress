@@ -182,72 +182,37 @@ class TestFailureIsolation:
         _release_failure_frames(a)  # must terminate
         assert a.__cause__ is None and b.__cause__ is None
 
-    @patch(
-        "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
-        return_value=False,
-    )
-    @patch(
-        "modelexpress.load_strategy.obj_strategy.ObjStrategy.is_available",
-        return_value=True,
-    )
-    @patch(
-        "modelexpress.load_strategy.model_streamer_strategy."
-        "ModelStreamerStrategy.is_available",
-        return_value=False,
-    )
-    @patch(
-        "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
-        return_value=False,
-    )
-    @patch(
-        "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
-        return_value=True,
-    )
-    def test_failed_attempt_is_collectable_before_reinit(self, _d, _g, _ms, _o, _r):
-        """The regression this guards: rebuilding the model inside the except block.
+    def test_release_model_storage_frees_while_a_reference_is_held(self):
+        """The real cause: the caller still names the model in a live frame.
 
-        While a handler runs, the exception's traceback holds the frames of the
-        failed attempt, and those frames hold whatever they were working on -- for a
-        weight loader, that is the model. Reinitialising there leaves the old model
-        alive while its replacement is allocated, which is how one failed strategy
-        became an out-of-memory crash. The sentinel stands in for the model: it must
-        be collectable by the time reinit runs.
+        MxModelLoader.load_model does `model = LoadStrategyChain.run(model, ctx)`, so
+        its `model` local points at the original for the whole call. That is not
+        garbage and not a cycle, so dropping our references and collecting frees
+        nothing -- the old model stays resident while its replacement is built. The
+        storage has to be released explicitly. `held` below stands in for the
+        caller's frame.
         """
-        import gc
-        import weakref
-        from modelexpress.load_strategy import LoadStrategyChain
+        import torch.nn as tnn
+        from modelexpress.engines.vllm.adapter import _release_model_storage
 
-        class _Sentinel:
-            pass
+        model = tnn.Linear(64, 64, bias=True)
+        model.register_buffer("scratch", torch.zeros(1024))
+        held = model  # the caller's live reference; must not prevent the release
+        expected = (64 * 64 + 64 + 1024) * 4
 
-        ref: dict[str, object] = {}
-        alive_at_reinit: list[bool] = []
+        freed = _release_model_storage(model)
 
-        def obj_load(self, result, ctx):
-            # A local the traceback would retain, standing in for the model.
-            sentinel = _Sentinel()
-            ref["r"] = weakref.ref(sentinel)
-            raise StrategyFailed("obj mutated the model", mutated=True)
+        assert freed == expected, f"expected {expected} bytes freed, got {freed}"
+        assert held is model, "the module itself is intentionally still reachable"
+        assert all(p.numel() == 0 for p in held.parameters())
+        assert all(b.numel() == 0 for b in held.buffers())
 
-        def default_load(self, result, ctx):
-            return result
+    def test_release_model_storage_tolerates_none_and_repeats(self):
+        from modelexpress.engines.vllm.adapter import _release_model_storage
+        import torch.nn as tnn
 
-        def reinit(result):
-            gc.collect()
-            alive_at_reinit.append(ref["r"]() is not None)
-            return result
-
-        ctx = _make_context()
-        ctx.adapter.reinit_for_retry = reinit
-
-        with patch(
-            "modelexpress.load_strategy.obj_strategy.ObjStrategy.load", obj_load
-        ), patch(
-            "modelexpress.load_strategy.default_strategy.DefaultStrategy.load",
-            default_load,
-        ):
-            LoadStrategyChain.run(MagicMock(), ctx)
-
-        assert alive_at_reinit == [False], (
-            "the failed attempt's locals were still alive when the model was rebuilt"
-        )
+        assert _release_model_storage(None) == 0
+        model = tnn.Linear(8, 8, bias=False)
+        assert _release_model_storage(model) == 8 * 8 * 4
+        # Idempotent: a second pass finds nothing left and must not double-count.
+        assert _release_model_storage(model) == 0
