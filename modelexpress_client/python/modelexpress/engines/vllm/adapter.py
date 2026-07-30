@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import logging
 import os
 import uuid
@@ -135,6 +136,12 @@ class VllmAdapter(EngineAdapter):
         result.value = None
         result.model = None
         del old_value
+        # Collect before releasing: the frames of the failed attempt form reference
+        # cycles, so dropping the last name for the old model is not enough to free
+        # it, and empty_cache() only returns memory the allocator already considers
+        # unused. Without this the previous model is still resident while its
+        # replacement is built, which on a large model means running out of VRAM.
+        gc.collect()
         torch.cuda.empty_cache()
         self._reset_compilation_state()
         logger.info(

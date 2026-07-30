@@ -491,9 +491,20 @@ class MxObjLoader:
         if not object_keys:
             return {}
 
-        probes = self._obj_manager.read_ranges_to_host(
-            [(key, 0, _HEADER_PROBE_BYTES) for key in object_keys]
-        )
+        try:
+            probes = self._obj_manager.read_ranges_to_host(
+                [(key, 0, _HEADER_PROBE_BYTES) for key in object_keys]
+            )
+        except Exception as e:
+            # The backend reports a transfer failure as NIXL_ERR_BACKEND, which says
+            # nothing about what was being read. This is the first request of the
+            # load, so the usual cause is that the objects are not where we looked --
+            # name the prefix and let the backend's own per-object log (HTTP status
+            # included) say why.
+            raise RuntimeError(
+                f"could not read safetensors headers for {len(object_keys)} shard "
+                f"object(s), first '{object_keys[0]}': {e}"
+            ) from e
 
         headers: dict[str, dict[str, dict]] = {}
         overflowed: list[tuple[str, int, int]] = []
