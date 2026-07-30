@@ -1184,3 +1184,105 @@ class TestReadRangesToHostFailurePaths:
             mgr.read_ranges_to_host([("a", 0, 8)])
 
         assert freed == ["obj-reg"], "the OBJ keys were left registered"
+
+
+# ---------------------------------------------------------------------------
+# Issue order across objects
+# ---------------------------------------------------------------------------
+
+
+class TestInterleaveByObject:
+    """Round-robin across objects, preserving each object's own offset order."""
+
+    @staticmethod
+    def _groups(spec):
+        """spec: {object_key: [offset, ...]} -> plan groups in object-major order."""
+        from modelexpress.obj_loader import _PlannedGroup
+        out = []
+        for key, offsets in spec.items():
+            for off in offsets:
+                out.append(
+                    _PlannedGroup(object_key=key, offset=off, size=1024, members=[])
+                )
+        return out
+
+    def test_round_robin_across_objects(self):
+        from modelexpress.obj_loader import _interleave_by_object
+
+        groups = self._groups({"a": [0, 10, 20], "b": [0, 10, 20], "c": [0, 10, 20]})
+        out = _interleave_by_object(groups)
+
+        assert [g.object_key for g in out] == [
+            "a", "b", "c", "a", "b", "c", "a", "b", "c"
+        ]
+
+    def test_offsets_stay_ascending_within_each_object(self):
+        # A server reading ahead inside one object must still see a forward scan.
+        from modelexpress.obj_loader import _interleave_by_object
+
+        groups = self._groups({"a": [0, 10, 20, 30], "b": [5, 15]})
+        out = _interleave_by_object(groups)
+
+        for key in ("a", "b"):
+            offsets = [g.offset for g in out if g.object_key == key]
+            assert offsets == sorted(offsets), f"{key} lost its forward order"
+
+    def test_uneven_counts_drain_the_longer_object_last(self):
+        from modelexpress.obj_loader import _interleave_by_object
+
+        groups = self._groups({"a": [0, 1, 2, 3], "b": [0]})
+        out = _interleave_by_object(groups)
+
+        assert [g.object_key for g in out] == ["a", "b", "a", "a", "a"]
+        assert len(out) == len(groups), "no group may be dropped or duplicated"
+
+    def test_single_object_is_unchanged(self):
+        from modelexpress.obj_loader import _interleave_by_object
+
+        groups = self._groups({"only": [0, 10, 20]})
+        assert _interleave_by_object(groups) == groups
+
+    def test_empty_and_single_group_are_safe(self):
+        from modelexpress.obj_loader import _interleave_by_object
+
+        assert _interleave_by_object([]) == []
+        one = self._groups({"a": [0]})
+        assert _interleave_by_object(one) == one
+
+    def test_every_group_is_preserved_exactly_once(self):
+        from modelexpress.obj_loader import _interleave_by_object
+
+        spec = {f"obj{i}": list(range(0, 10 * (i + 1), 10)) for i in range(15)}
+        groups = self._groups(spec)
+        out = _interleave_by_object(groups)
+
+        assert sorted(out, key=lambda g: (g.object_key, g.offset)) == sorted(
+            groups, key=lambda g: (g.object_key, g.offset)
+        )
+
+    def test_disabled_by_default_and_enabled_by_env(self):
+        from modelexpress.obj_loader import _interleave_enabled
+
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("MX_OBJ_INTERLEAVE", None)
+            assert _interleave_enabled() is False
+        with patch.dict("os.environ", {"MX_OBJ_INTERLEAVE": "1"}):
+            assert _interleave_enabled() is True
+        with patch.dict("os.environ", {"MX_OBJ_INTERLEAVE": "0"}):
+            assert _interleave_enabled() is False
+
+    def test_plan_order_follows_the_switch(self):
+        loader = _loader()
+        headers = _headers(3, tensors_per_shard=2, tensor_size=1024 * 1024)
+
+        object_major = _plan(loader, headers, MX_OBJ_GROUP_MB="1")
+        with patch.dict("os.environ", {"MX_OBJ_INTERLEAVE": "1"}):
+            interleaved = _plan(loader, headers, MX_OBJ_GROUP_MB="1")
+
+        assert len(interleaved) == len(object_major)
+        # Object-major repeats a key before moving on; interleaved does not.
+        major_keys = [g.object_key for g in object_major]
+        inter_keys = [g.object_key for g in interleaved]
+        assert major_keys[0] == major_keys[1], f"expected object-major, got {major_keys}"
+        assert inter_keys[0] != inter_keys[1], f"expected interleaved, got {inter_keys}"

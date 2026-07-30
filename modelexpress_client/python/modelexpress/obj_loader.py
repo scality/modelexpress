@@ -96,6 +96,54 @@ _STAGING_VRAM_CEILING = 0.5
 _HEADER_PROBE_BYTES = 64 * 1024
 
 
+def _interleave_enabled() -> bool:
+    """Whether to issue groups round-robin across objects rather than object by object.
+
+    Off by default: it changes the order tensors reach the engine on every load, and
+    the throughput case for it is a hypothesis until measured on hardware. Set
+    MX_OBJ_INTERLEAVE=1 to compare the two orders.
+    """
+    return os.environ.get("MX_OBJ_INTERLEAVE", "0") == "1"
+
+
+def _interleave_by_object(groups: list[_PlannedGroup]) -> list[_PlannedGroup]:
+    """Reorder groups round-robin across objects, keeping each object's own order.
+
+    How many objects the in-flight set touches is the staging window divided by the
+    bytes behind each object -- group size cancels out, since halving it doubles both
+    the groups in the window and the groups per object. Read object by object, a
+    51 GiB model in 15 shards puts 3.4 GiB behind each key, so a 4 GiB window spans
+    about one object and every concurrent request lands on it. The same model in 127
+    shards has 0.4 GiB per key and the window spans ten. That is the entire measured
+    difference between 26.8 and 16.6 GiB/s on Gemma-3-27B, with request count,
+    request size, concurrency and rail balance identical in both runs.
+
+    The window cannot simply be widened: the staging pool is a single NIXL
+    registration, so it is capped just under 4 GiB. Issue order is the only lever
+    left, and round-robin makes the window span every object the model has, however
+    the checkpoint was packed.
+
+    Offsets within an object stay ascending, so a server reading ahead within one
+    object still sees a forward scan -- only spread out in time.
+    """
+    if len(groups) < 2:
+        return list(groups)
+    pending: dict[str, deque[_PlannedGroup]] = {}
+    for group in groups:
+        pending.setdefault(group.object_key, deque()).append(group)
+    if len(pending) < 2:
+        return list(groups)
+
+    out: list[_PlannedGroup] = []
+    while pending:
+        for key in list(pending):
+            queue = pending[key]
+            out.append(queue.popleft())
+            if not queue:
+                del pending[key]
+    return out
+
+
 class _PlannedTensor(NamedTuple):
     """One tensor within a group: where it sits in the group's buffer."""
 
@@ -274,6 +322,7 @@ class MxObjLoader:
 
         budget = self._resolve_staging_budget(max(g.size for g in plan))
         ntensors = sum(len(g.members) for g in plan)
+        self._log_object_spread(plan, budget)
 
         pbar = None
         if use_tqdm:
@@ -408,6 +457,29 @@ class MxObjLoader:
             available / (1024 ** 3),
         )
         return budget
+
+    @staticmethod
+    def _log_object_spread(plan: list[_PlannedGroup], budget: int) -> None:
+        """Report how many distinct objects the in-flight set will touch.
+
+        The number that explains read throughput, and the one that is invisible
+        otherwise: concurrent requests all landing on one object contend on that
+        object's placement, however many of them there are.
+        """
+        keys = {g.object_key for g in plan}
+        total = sum(g.size for g in plan)
+        if not keys or not total:
+            return
+        per_object = total / len(keys)
+        mean_group = total / len(plan)
+        in_order = min(len(keys), max(1.0, budget / per_object))
+        interleaved = min(len(keys), max(1.0, budget / mean_group))
+        logger.info(
+            "OBJ staging window %.1f GiB over %d object(s) of %.1f GiB: reaches "
+            "~%.1f object(s) in object order, ~%.0f interleaved (MX_OBJ_INTERLEAVE)",
+            budget / (1024 ** 3), len(keys), per_object / (1024 ** 3),
+            in_order, interleaved,
+        )
 
     def _ensure_obj_manager(self) -> None:
         """Lazily create and initialize the OBJ transfer manager."""
@@ -633,12 +705,17 @@ class MxObjLoader:
         flush()
 
         total = sum(g.size for g in groups)
+        interleaved = _interleave_enabled()
+        if interleaved:
+            groups = _interleave_by_object(groups)
         logger.info(
             "OBJ plan: %d tensors in %d group(s) across %d shard object(s), "
-            "%.1f GiB total, %.1f MiB mean group (target %.0f MiB)",
+            "%.1f GiB total, %.1f MiB mean group (target %.0f MiB), "
+            "issued %s",
             ntensors, len(groups), len(shard_basenames), total / (1024 ** 3),
             (total / len(groups) if groups else 0) / (1024 ** 2),
             target / (1024 ** 2),
+            "round-robin across objects" if interleaved else "object by object",
         )
         return groups
 
