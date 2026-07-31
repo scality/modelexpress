@@ -1260,13 +1260,15 @@ class TestInterleaveByObject:
             groups, key=lambda g: (g.object_key, g.offset)
         )
 
-    def test_disabled_by_default_and_enabled_by_env(self):
+    def test_enabled_by_default_and_disabled_by_env(self):
+        # Default flipped on after measuring both packings: faster in each and
+        # never slower. MX_OBJ_INTERLEAVE=0 restores object-at-a-time order.
         from modelexpress.obj_loader import _interleave_enabled
 
         with patch.dict("os.environ", {}, clear=False):
             import os
             os.environ.pop("MX_OBJ_INTERLEAVE", None)
-            assert _interleave_enabled() is False
+            assert _interleave_enabled() is True
         with patch.dict("os.environ", {"MX_OBJ_INTERLEAVE": "1"}):
             assert _interleave_enabled() is True
         with patch.dict("os.environ", {"MX_OBJ_INTERLEAVE": "0"}):
@@ -1276,9 +1278,12 @@ class TestInterleaveByObject:
         loader = _loader()
         headers = _headers(3, tensors_per_shard=2, tensor_size=1024 * 1024)
 
-        object_major = _plan(loader, headers, MX_OBJ_GROUP_MB="1")
-        with patch.dict("os.environ", {"MX_OBJ_INTERLEAVE": "1"}):
-            interleaved = _plan(loader, headers, MX_OBJ_GROUP_MB="1")
+        object_major = _plan(
+            loader, headers, MX_OBJ_GROUP_MB="1", MX_OBJ_INTERLEAVE="0"
+        )
+        interleaved = _plan(
+            loader, headers, MX_OBJ_GROUP_MB="1", MX_OBJ_INTERLEAVE="1"
+        )
 
         assert len(interleaved) == len(object_major)
         # Object-major repeats a key before moving on; interleaved does not.

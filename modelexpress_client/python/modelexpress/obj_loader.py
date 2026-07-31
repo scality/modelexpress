@@ -99,11 +99,15 @@ _HEADER_PROBE_BYTES = 64 * 1024
 def _interleave_enabled() -> bool:
     """Whether to issue groups round-robin across objects rather than object by object.
 
-    Off by default: it changes the order tensors reach the engine on every load, and
-    the throughput case for it is a hypothesis until measured on hardware. Set
-    MX_OBJ_INTERLEAVE=1 to compare the two orders.
+    On by default, measured on Gemma-3-27B over 4x100G: it is faster in both
+    packings and never slower, and it makes the two indistinguishable.
+
+        15 shards:  3.05s -> 1.88s   17.4 -> 29.1 GiB/s
+       127 shards:  2.06s -> 1.94s   26.9 -> 29.0 GiB/s
+
+    MX_OBJ_INTERLEAVE=0 restores object-at-a-time issue order.
     """
-    return os.environ.get("MX_OBJ_INTERLEAVE", "0") == "1"
+    return os.environ.get("MX_OBJ_INTERLEAVE", "1") != "0"
 
 
 def _interleave_by_object(groups: list[_PlannedGroup]) -> list[_PlannedGroup]:
@@ -121,7 +125,9 @@ def _interleave_by_object(groups: list[_PlannedGroup]) -> list[_PlannedGroup]:
     The window cannot simply be widened: the staging pool is a single NIXL
     registration, so it is capped just under 4 GiB. Issue order is the only lever
     left, and round-robin makes the window span every object the model has, however
-    the checkpoint was packed.
+    the checkpoint was packed. Measured: 15 shards 17.4 -> 29.1 GiB/s, 127 shards
+    26.9 -> 29.0, the two packings then within 3% of each other. Shard count stops
+    being a throughput parameter.
 
     Offsets within an object stay ascending, so a server reading ahead within one
     object still sees a forward scan -- only spread out in time.

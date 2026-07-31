@@ -406,7 +406,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_OBJ_TIMEOUT` | `300` | OBJ transfer timeout in seconds, measured from when a transfer is posted. |
 | `MX_OBJ_GROUP_MB` | `64` | Target size of one OBJ transfer. Consecutive tensors in a shard are coalesced into contiguous groups of about this size, so one descriptor covers several tensors. Sets both the descriptor size the backend sees and the delivery granularity (a group's tensors become available together). |
 | `MX_OBJ_STAGING_MB` | (auto: `max(4096, largest group)`, capped at 50% of free VRAM) | GPU memory the loader may hold in staging buffers for groups requested but not yet consumed. Bounds memory only, not request count — its job is just to keep the backend's request queue non-empty, and 4 GiB covers 512 concurrent 8 MiB requests. Flat rather than a multiple of the largest group, because coalescing cannot split a tensor and one oversized tensor would otherwise set the budget for the whole model. A group bigger than the budget is always admitted. Capped at just under 4 GiB (the backend's single-registration limit) because the pool is one registration. |
-| `MX_OBJ_INTERLEAVE` | `0` | Issue transfers round-robin across shard objects instead of walking one object at a time. Which matters because the number of distinct objects the in-flight set touches is the staging window divided by the bytes behind each object — group size cancels out — and the window cannot exceed ~4 GiB because the pool is a single NIXL registration. A 51 GiB model in 15 shards puts 3.4 GiB per object, so object-order reading reaches ~1 object and every concurrent request contends on it; the same model in 127 shards reaches ~10. Measured on Gemma-3-27B: 26.8 GiB/s at 127 shards against 16.6 at 15, with request count, size, concurrency and rail balance identical. `1` makes the window span every object whatever the packing. Off by default pending a measurement of the interleaved order itself. |
+| `MX_OBJ_INTERLEAVE` | `1` | Issue transfers round-robin across shard objects rather than walking one object at a time. The number of distinct objects the in-flight set touches is the staging window divided by the bytes behind each object — group size cancels out — and the window cannot exceed ~4 GiB because the pool is a single NIXL registration. Object-at-a-time issue order therefore makes a few large shards read badly: 3.4 GiB per object reaches ~1 object and every concurrent request contends on it. Round-robin spans every object whatever the packing, which removes shard count as a throughput parameter — see [Throughput tuning](#throughput-tuning) for the measurements. `0` restores the old order. |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
@@ -540,20 +540,26 @@ halving it doubles both the groups in the window and the groups per
 object — and the window is capped near 4 GiB because the pool is a
 single NIXL registration.
 
-That makes shard count a throughput parameter. Measured on Gemma-3-27B,
-51.1 GiB, `max_inflight=128`, everything else identical:
+Read object at a time, that makes shard count a throughput parameter.
+Round-robin issue order (`MX_OBJ_INTERLEAVE`, on by default) removes it.
+Measured on Gemma-3-27B, 51.1 GiB, `max_inflight=128`, 4x100G, nothing
+else varied:
 
-| shards | bytes per object | objects in a 4 GiB window | throughput |
-|---|---|---|---|
-| 127 | 0.40 GiB | ~10 | 26.8 GiB/s |
-| 15 | 3.41 GiB | ~1.2 | 16.6 GiB/s |
+| shards | bytes/object | objects in window | object order | round-robin |
+|---|---|---|---|---|
+| 127 | 0.40 GiB | ~10 → ~26 | 26.9 GiB/s | **29.0 GiB/s** |
+| 15 | 3.41 GiB | ~1.2 → 15 | 17.4 GiB/s | **29.1 GiB/s** |
 
-Request count (6839 vs 6860), request size, concurrency and per-rail
-balance were the same in both; only per-request service time differed
-(279 vs 448 us). `MX_OBJ_INTERLEAVE=1` issues groups round-robin across
-objects so the window spans every object the model has, whatever the
-packing. The `OBJ staging window ...` log line reports both figures for
-the model at hand.
+Faster in both packings, and the two become indistinguishable (1.94 s vs
+1.88 s end to end). Request count (6839 vs 6860), request size,
+concurrency and per-rail balance were identical throughout; only
+per-request service time moved, 279 us against 448 us. The
+`OBJ staging window ...` log line reports both figures for the model at
+hand, so the mechanism is visible without arithmetic.
+
+Set `MX_OBJ_INTERLEAVE=0` to restore object-at-a-time order — worth
+trying if a backend rewards long sequential scans within one object more
+than it rewards spreading across them.
  Groups also break at object boundaries, at any gap in the byte
 range, and where a tensor's dtype could not be viewed at its offset
 within the group.
