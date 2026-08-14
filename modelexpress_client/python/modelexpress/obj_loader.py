@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import re
 import time
 import uuid
@@ -316,8 +317,35 @@ class MxObjLoader:
 
         device = torch.device("cuda", self._device_id)
 
+        # MX_OVERLAP_REG=1: allocate+register the staging pool concurrently with
+        # the header-probe round trip. Speculative budget uses largest_group=0,
+        # which resolves identically to the real budget unless a single group
+        # exceeds the 4GiB floor -- that rare case reopens at the exact size
+        # below. Agent sync_mode is THREAD_SYNC_RW, so registerMem from this
+        # thread is safe against the probe's prepXfer path.
+        pool_thread = None
+        pool_exc: list[BaseException] = []
+        spec_budget = 0
+        if os.environ.get("MX_OVERLAP_REG") == "1":
+            spec_budget = self._resolve_staging_budget(0)
+
+            def _open_pool_early() -> None:
+                try:
+                    self._obj_manager.open_pool(spec_budget, device)
+                except BaseException as e:
+                    pool_exc.append(e)
+
+            pool_thread = threading.Thread(
+                target=_open_pool_early, name="mx-obj-pool-reg", daemon=True
+            )
+            pool_thread.start()
+
         plan = self._build_plan(prefix, shard_basenames)
         if not plan:
+            if pool_thread is not None:
+                pool_thread.join()
+                if not pool_exc:
+                    self._obj_manager.close_pool()
             return
 
         budget = self._resolve_staging_budget(max(g.size for g in plan))
@@ -347,7 +375,20 @@ class MxObjLoader:
         #
         # Entries are popped before being drained, so a failure mid-drain cannot
         # double-await one; whatever is still queued is drained by the finally.
-        self._obj_manager.open_pool(budget, device)
+        if pool_thread is not None:
+            pool_thread.join()
+            if pool_exc:
+                raise pool_exc[0]
+            if budget > spec_budget:
+                logger.info(
+                    "OBJ overlapped pool (%.1f GiB) below resolved budget "
+                    "(%.1f GiB); reopening at exact size",
+                    spec_budget / (1024 ** 3), budget / (1024 ** 3),
+                )
+                self._obj_manager.close_pool()
+                self._obj_manager.open_pool(budget, device)
+        else:
+            self._obj_manager.open_pool(budget, device)
         self._obj_manager.register_objects(
             {key: end for key, end in self._object_extents(plan).items()}
         )
