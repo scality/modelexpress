@@ -2,31 +2,30 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-NIXL OBJ Transfer Manager for direct object-store-to-GPU weight loading.
+NIXL object-segment transfer manager for direct object-store-to-GPU weight loading.
 
-Uses NIXL's OBJ plugin to move object bytes into GPU memory, bypassing CPU
-bounce buffers the way the GDS_MT path does for local NVMe. The OBJ plugin
-is engine-agnostic: it supports plain AWS S3, the high-performance S3 CRT
-client, and vendor GPU-direct accelerated engines. Which engine is used is
-decided entirely by the backend parameter map, not by this module.
-
-The backend parameters (``type``, ``accelerated``, ``endpoint_override``,
-``bucket``, ``region``, credentials, ``crtMinLimit``, ``num_threads``, ...)
-are supplied verbatim via the ``MX_OBJ_PARAMS`` environment variable (a JSON
-object) and passed straight to ``create_backend("OBJ", params)``. See the
-NIXL OBJ plugin README for the full parameter vocabulary.
+Moves object bytes into GPU memory through any NIXL backend that exposes object
+segments (``OBJ_SEG``), bypassing CPU bounce buffers the way the GDS_MT path does
+for local NVMe. Which backend is used is chosen by name, not hard-coded: the S3
+``OBJ`` plugin (plain S3, S3 CRT, S3 accelerated engines), the Scality ``REST``
+plugin, ``AZURE_BLOB``, ``INFINIA``, ... all share the same object-segment model,
+where an object key is registered against a devId and transfers name the devId.
 
 Environment variables:
-    MX_OBJ_PARAMS: JSON object of NIXL OBJ backend parameters, passed
-                   verbatim to the backend, e.g.
-                   '{"bucket":"my-models","region":"us-east-1"}' or, for a
-                   GPU-direct accelerated engine,
-                   '{"accelerated":"true","type":"<engine>",
-                     "endpoint_override":"http://host:port"}'.
+    MX_OBJ_BACKEND: NIXL backend (plugin) name to create, default ``OBJ``. It must
+                    expose ``OBJ_SEG``.
+    MX_OBJ_PARAMS: JSON object of backend parameters, passed verbatim to
+                   ``create_backend(MX_OBJ_BACKEND, params)``, e.g.
+                   '{"bucket":"my-models","region":"us-east-1"}' for ``OBJ`` or
+                   '{"endpoint_override":"http://host:port"}' for ``REST``. See
+                   the backend's README for its parameter vocabulary.
+    MX_OBJ_MAX_REG_MB: Largest single memory registration the backend accepts,
+                       in MiB. Defaults to the cuObject limit for ``OBJ`` and to
+                       no limit for any other backend; ``0`` means no limit.
     MX_OBJ_TIMEOUT: Transfer timeout in seconds (default: 300)
 
 Request size, concurrency and NIC selection are the backend's concern, not ours:
-each byte range is handed down as one descriptor and the OBJ backend cuts it into
+each byte range is handed down as one descriptor and the backend cuts it into
 requests (``split_size``) and bounds how many run at once (``max_inflight``). We
 set neither -- ``MX_OBJ_PARAMS`` is forwarded verbatim, so an unset key keeps the
 backend's own default rather than one chosen here.
@@ -38,7 +37,7 @@ default can infer. See ``obj_backend_params``.
 
 from __future__ import annotations
 
-import ctypes
+import functools
 import json
 import logging
 import os
@@ -69,8 +68,15 @@ except ImportError:
 # The exact figure moved between CUDA releases -- cuobjclient.h defines it as
 # 4 GiB in 13.2 and 4 GiB - 64 KiB in 13.3 -- so use the smaller one, which is
 # valid against both. An exact 4 GiB registration is rejected on 13.3.
+#
+# It is also below the 32-bit size field of a cuObject RDMA descriptor, which
+# backends speaking that descriptor format (REST included) cannot exceed per
+# request, so per-transfer descriptors are split at it whatever the backend.
 MAX_REG_BYTES = 4 * 1024 * 1024 * 1024 - 64 * 1024
-_OBJ_BACKEND = "OBJ"
+_DEFAULT_BACKEND = "OBJ"
+# Backends whose single-registration limit is MAX_REG_BYTES. Any other backend
+# registers without a limit unless MX_OBJ_MAX_REG_MB says otherwise.
+_CUOBJECT_REG_BACKENDS = frozenset({"OBJ"})
 
 # Packing alignment for host reads. Only the packing is aligned, not the object
 # offsets, so this costs at most 63 bytes per range and keeps each range's write
@@ -81,15 +87,40 @@ _HOST_READ_ALIGN = 64
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
-# Backend parameter keys that must never be logged.
-_SENSITIVE_PARAMS = frozenset({"access_key", "secret_key", "session_token"})
+# Substrings marking a backend parameter whose value must never be logged. Matched
+# by name rather than listed per backend, since the parameter map is free-form.
+_SENSITIVE_PARAM_MARKERS = (
+    "key", "secret", "token", "password", "credential", "connection_string",
+)
+
+
+def obj_backend_name() -> str:
+    """The NIXL backend to create, from MX_OBJ_BACKEND (default ``OBJ``)."""
+    return os.environ.get("MX_OBJ_BACKEND", "").strip() or _DEFAULT_BACKEND
+
+
+def registration_limit(backend: str) -> int | None:
+    """Largest single memory registration ``backend`` accepts, or None if unbounded.
+
+    MX_OBJ_MAX_REG_MB overrides the built-in value; ``0`` lifts the limit.
+    """
+    override = os.environ.get("MX_OBJ_MAX_REG_MB", "").strip()
+    if override:
+        try:
+            mb = int(override)
+        except ValueError as e:
+            raise ValueError(f"MX_OBJ_MAX_REG_MB is not an integer: {override!r}") from e
+        if mb < 0:
+            raise ValueError(f"MX_OBJ_MAX_REG_MB must be >= 0, got {mb}")
+        return mb * 1024 * 1024 if mb else None
+    return MAX_REG_BYTES if backend in _CUOBJECT_REG_BACKENDS else None
 
 
 def obj_backend_params() -> dict[str, str]:
-    """Parse the NIXL OBJ backend parameters from MX_OBJ_PARAMS.
+    """Parse the NIXL backend parameters from MX_OBJ_PARAMS.
 
     Returns a (possibly empty) map of string->string suitable for
-    ``create_backend("OBJ", params)``. Raises ValueError if MX_OBJ_PARAMS
+    ``create_backend(obj_backend_name(), params)``. Raises ValueError if MX_OBJ_PARAMS
     is set but is not a JSON object.
 
     Defaults ``dram_rdma`` to false. That is not transport tuning -- it declares how
@@ -116,35 +147,56 @@ def obj_backend_params() -> dict[str, str]:
 def _redact(params: dict[str, str]) -> dict[str, str]:
     """Return params with sensitive values masked, for logging."""
     return {
-        k: ("***" if k in _SENSITIVE_PARAMS else v) for k, v in params.items()
+        k: ("***" if any(m in k.lower() for m in _SENSITIVE_PARAM_MARKERS) else v)
+        for k, v in params.items()
     }
 
 
-def _obj_plugin_loadable() -> bool:
-    """Check if the NIXL OBJ plugin shared library can be loaded."""
+@functools.lru_cache(maxsize=None)
+def _backend_exposes_obj_seg(backend: str) -> bool:
+    """Check that NIXL has a plugin named ``backend`` and that it exposes OBJ_SEG.
+
+    Asks NIXL itself rather than probing for the plugin library, so it finds
+    plugins wherever the installed NIXL keeps them. Cached: the answer cannot
+    change within a process, and each probe creates an agent.
+    """
     try:
-        ctypes.CDLL("libplugin_OBJ.so")
-        return True
-    except OSError:
+        agent = NixlAgent(
+            f"mx-obj-probe-{os.getpid()}", NixlAgentConfig(backends=[])
+        )
+        plugins = agent.get_plugin_list()
+        if backend not in plugins:
+            logger.info(
+                "OBJ not available: NIXL plugin '%s' not found (available: %s)",
+                backend, ", ".join(sorted(plugins)),
+            )
+            return False
+        mem_types = agent.get_plugin_mem_types(backend)
+    except Exception as e:
+        logger.info("OBJ not available: NIXL plugin discovery failed: %s", e)
         return False
+    if "OBJ_SEG" not in mem_types:
+        logger.info(
+            "OBJ not available: NIXL plugin '%s' does not expose OBJ_SEG "
+            "(supports: %s)", backend, ", ".join(mem_types),
+        )
+        return False
+    return True
 
 
 def is_obj_available() -> bool:
     """
-    Check whether the NIXL OBJ backend is usable on this host.
+    Check whether the configured object-segment backend is usable on this host.
 
-    NIXL must be installed and the OBJ plugin shared library must be
-    loadable. Backend-specific prerequisites (S3 credentials, the
-    cuObject/RDMA fabric for accelerated engines, etc.) are validated
-    lazily at backend-creation time in initialize(); a failure there
-    surfaces as a load-strategy fall-through rather than a crash.
+    NIXL must be installed and the MX_OBJ_BACKEND plugin must exist and expose
+    OBJ_SEG. Backend-specific prerequisites (endpoint, credentials, the RDMA
+    fabric for accelerated backends, GPU memory support, etc.) are validated
+    lazily at backend-creation and registration time; a failure there surfaces
+    as a load-strategy fall-through rather than a crash.
     """
     if not NIXL_AVAILABLE:
         return False
-    if not _obj_plugin_loadable():
-        logger.debug("OBJ not available: libplugin_OBJ.so not found")
-        return False
-    return True
+    return _backend_exposes_obj_seg(obj_backend_name())
 
 
 @dataclass
@@ -172,10 +224,10 @@ class ObjBatchHandle:
 
 class ObjTransferManager:
     """
-    Manages a NIXL OBJ backend for object-to-GPU transfers.
+    Manages a NIXL object-segment backend for object-to-GPU transfers.
 
-    Engine selection (plain S3, S3 CRT, or a GPU-direct accelerated engine)
-    is governed entirely by ``params``; this class is engine-agnostic.
+    The backend is named by ``backend`` (default MX_OBJ_BACKEND) and configured
+    entirely by ``params``; this class only relies on the OBJ_SEG contract.
 
     Supports batch loading: all ranges of one object are submitted in a
     single NIXL transfer so the backend drives them in parallel.
@@ -186,9 +238,16 @@ class ObjTransferManager:
             obj.batch_load_object(key, [(offset, size)], device)
     """
 
-    def __init__(self, agent_name: str, params: dict[str, str] | None = None):
+    def __init__(
+        self,
+        agent_name: str,
+        params: dict[str, str] | None = None,
+        backend: str | None = None,
+    ):
         self._agent_name = agent_name
+        self._backend = backend if backend is not None else obj_backend_name()
         self._params = params if params is not None else obj_backend_params()
+        self._max_reg_bytes = registration_limit(self._backend)
         self._device_id: int | None = None
         self._agent: Any = None
         # Monotonic OBJ devId source; see submit_objects for why it must not reset.
@@ -212,8 +271,17 @@ class ObjTransferManager:
     def agent_name(self) -> str:
         return self._agent_name
 
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    @property
+    def max_reg_bytes(self) -> int | None:
+        """Largest single registration the backend accepts, or None if unbounded."""
+        return self._max_reg_bytes
+
     def initialize(self) -> None:
-        """Initialize the NIXL agent and create the OBJ backend."""
+        """Initialize the NIXL agent and create the object-segment backend."""
         if not NIXL_AVAILABLE:
             raise RuntimeError(
                 "NIXL is not available. Install with: pip install nixl[cu12]"
@@ -223,23 +291,23 @@ class ObjTransferManager:
 
         self._device_id = torch.cuda.current_device()
 
-        # Create the agent without auto-initializing UCX; the OBJ backend
+        # Create the agent without auto-initializing UCX; the object backend
         # needs custom params and is created explicitly below.
         #
         # sync_mode is explicit: NIXL's default resolves to THREAD_SYNC_NONE when
         # the listener thread is off, which compiles the agent's locks down to
-        # no-ops and leaves the OBJ engine's devId->objKey map unguarded. RW takes
+        # no-ops and leaves the backend's devId->objKey map unguarded. RW takes
         # the writer lock in registerMem and a reader lock on the prepXfer path.
         config = NixlAgentConfig(
             backends=[],
             sync_mode=NixlThreadSync.NIXL_THREAD_SYNC_RW,
         )
         self._agent = NixlAgent(self._agent_name, config)
-        self._agent.create_backend(_OBJ_BACKEND, self._params)
+        self._agent.create_backend(self._backend, self._params)
 
         logger.info(
-            "OBJ agent '%s' created on device %d (params=%s)",
-            self._agent_name, self._device_id, _redact(self._params),
+            "OBJ agent '%s' created on device %d with backend %s (params=%s)",
+            self._agent_name, self._device_id, self._backend, _redact(self._params),
         )
 
     def batch_load_object(
@@ -254,7 +322,7 @@ class ObjTransferManager:
         schedule them; one range here may become several requests on the wire.
 
         Args:
-            object_key: Object key relative to the OBJ backend's bucket/endpoint.
+            object_key: Object key relative to the backend's bucket/endpoint.
             range_list: [(object_offset, size), ...]
             device: Target CUDA device.
 
@@ -321,10 +389,10 @@ class ObjTransferManager:
             raise RuntimeError("OBJ agent not initialized")
         if self._pool is not None:
             raise RuntimeError("OBJ staging pool already open")
-        if pool_bytes > MAX_REG_BYTES:
+        if self._max_reg_bytes is not None and pool_bytes > self._max_reg_bytes:
             raise RuntimeError(
-                f"OBJ staging pool of {pool_bytes} bytes exceeds the backend's "
-                f"registration limit of {MAX_REG_BYTES}"
+                f"OBJ staging pool of {pool_bytes} bytes exceeds the {self._backend} "
+                f"backend's registration limit of {self._max_reg_bytes}"
             )
 
         pool = torch.empty(pool_bytes, dtype=torch.uint8, device=device)
@@ -539,7 +607,7 @@ class ObjTransferManager:
         obj_regions = []
         vram_regions = []
 
-        # The OBJ backend resolves each descriptor's object key by its devId
+        # The backend resolves each descriptor's object key by its devId
         # (registerMem stores devIdToObjKey_[devId]=key; prepXfer looks the key
         # up by the remote descriptor's devId). Every object must therefore get a
         # DISTINCT devId -- reusing one collides every key onto a single map slot
@@ -557,8 +625,8 @@ class ObjTransferManager:
         # Each range is one descriptor, whatever its size. The backend cuts it into
         # requests of at most its own split_size and decides which NIC each rides,
         # so request size and rail spread are not ours to choose. The only split
-        # here is the cuObject registration ceiling, which is a hard limit rather
-        # than a tuning knob.
+        # here is MAX_REG_BYTES, a hard per-descriptor limit rather than a tuning
+        # knob (see its definition).
         for object_key, range_list in jobs:
             obj_dev_id = self._next_obj_dev_id
             self._next_obj_dev_id += 1

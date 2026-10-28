@@ -27,16 +27,78 @@ class TestIsObjAvailable:
         assert is_obj_available() is False
 
     @patch("modelexpress.obj_transfer.NIXL_AVAILABLE", True)
-    @patch("modelexpress.obj_transfer._obj_plugin_loadable", return_value=False)
+    @patch("modelexpress.obj_transfer._backend_exposes_obj_seg", return_value=False)
     def test_no_plugin(self, _mock_plugin):
         from modelexpress.obj_transfer import is_obj_available
         assert is_obj_available() is False
 
     @patch("modelexpress.obj_transfer.NIXL_AVAILABLE", True)
-    @patch("modelexpress.obj_transfer._obj_plugin_loadable", return_value=True)
+    @patch("modelexpress.obj_transfer._backend_exposes_obj_seg", return_value=True)
     def test_all_present(self, _mock_plugin):
         from modelexpress.obj_transfer import is_obj_available
         assert is_obj_available() is True
+
+    @patch("modelexpress.obj_transfer.NIXL_AVAILABLE", True)
+    @patch("modelexpress.obj_transfer._backend_exposes_obj_seg", return_value=True)
+    def test_probes_the_configured_backend(self, mock_probe):
+        from modelexpress.obj_transfer import is_obj_available
+        with patch.dict("os.environ", {"MX_OBJ_BACKEND": "REST"}):
+            assert is_obj_available() is True
+        mock_probe.assert_called_once_with("REST")
+
+
+class TestObjBackendName:
+    """Tests for MX_OBJ_BACKEND selection."""
+
+    def test_defaults_to_obj(self):
+        from modelexpress.obj_transfer import obj_backend_name
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("MX_OBJ_BACKEND", None)
+            assert obj_backend_name() == "OBJ"
+
+    def test_blank_falls_back_to_obj(self):
+        from modelexpress.obj_transfer import obj_backend_name
+        with patch.dict("os.environ", {"MX_OBJ_BACKEND": "  "}):
+            assert obj_backend_name() == "OBJ"
+
+    def test_explicit_backend(self):
+        from modelexpress.obj_transfer import obj_backend_name
+        with patch.dict("os.environ", {"MX_OBJ_BACKEND": " REST "}):
+            assert obj_backend_name() == "REST"
+
+
+class TestRegistrationLimit:
+    """The single-registration cap is cuObject's, so only OBJ has it by default."""
+
+    def _limit(self, backend, env):
+        from modelexpress.obj_transfer import registration_limit
+        with patch.dict("os.environ", env, clear=False):
+            import os
+            if "MX_OBJ_MAX_REG_MB" not in env:
+                os.environ.pop("MX_OBJ_MAX_REG_MB", None)
+            return registration_limit(backend)
+
+    def test_obj_is_capped(self):
+        from modelexpress.obj_transfer import MAX_REG_BYTES
+        assert self._limit("OBJ", {}) == MAX_REG_BYTES
+
+    def test_other_backends_are_unbounded(self):
+        assert self._limit("REST", {}) is None
+        assert self._limit("AZURE_BLOB", {}) is None
+
+    def test_override_sets_the_cap(self):
+        env = {"MX_OBJ_MAX_REG_MB": "8192"}
+        assert self._limit("REST", env) == 8192 * 1024 * 1024
+        assert self._limit("OBJ", env) == 8192 * 1024 * 1024
+
+    def test_zero_lifts_the_cap(self):
+        assert self._limit("OBJ", {"MX_OBJ_MAX_REG_MB": "0"}) is None
+
+    @pytest.mark.parametrize("value", ["abc", "-1"])
+    def test_invalid_override_raises(self, value):
+        with pytest.raises(ValueError, match="MX_OBJ_MAX_REG_MB"):
+            self._limit("OBJ", {"MX_OBJ_MAX_REG_MB": value})
 
 
 class TestObjBackendParams:
@@ -83,19 +145,45 @@ class TestObjBackendParams:
                 obj_backend_params()
 
 
-class TestObjPluginLoadable:
-    """Tests for libplugin_OBJ.so detection."""
+class TestBackendExposesObjSeg:
+    """Tests for plugin discovery through NIXL."""
 
-    @patch("ctypes.CDLL")
-    def test_loadable(self, mock_cdll):
-        from modelexpress.obj_transfer import _obj_plugin_loadable
-        assert _obj_plugin_loadable() is True
-        mock_cdll.assert_called_once_with("libplugin_OBJ.so")
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        from modelexpress.obj_transfer import _backend_exposes_obj_seg
+        _backend_exposes_obj_seg.cache_clear()
+        yield
+        _backend_exposes_obj_seg.cache_clear()
 
-    @patch("ctypes.CDLL", side_effect=OSError("not found"))
-    def test_not_loadable(self, _mock_cdll):
-        from modelexpress.obj_transfer import _obj_plugin_loadable
-        assert _obj_plugin_loadable() is False
+    def _probe(self, backend, plugins, mem_types=None, error=None):
+        from modelexpress.obj_transfer import _backend_exposes_obj_seg
+
+        class _Agent:
+            def get_plugin_list(self):
+                if error is not None:
+                    raise error
+                return plugins
+
+            def get_plugin_mem_types(self, name):
+                return mem_types[name]
+
+        with patch("modelexpress.obj_transfer.NixlAgent", return_value=_Agent()), \
+             patch("modelexpress.obj_transfer.NixlAgentConfig"):
+            return _backend_exposes_obj_seg(backend)
+
+    def test_plugin_with_obj_seg(self):
+        assert self._probe(
+            "REST", ["OBJ", "REST"], {"REST": ["DRAM_SEG", "VRAM_SEG", "OBJ_SEG"]}
+        ) is True
+
+    def test_missing_plugin(self):
+        assert self._probe("REST", ["OBJ", "UCX"]) is False
+
+    def test_plugin_without_obj_seg(self):
+        assert self._probe("UCX", ["UCX"], {"UCX": ["DRAM_SEG", "VRAM_SEG"]}) is False
+
+    def test_discovery_failure(self):
+        assert self._probe("OBJ", [], error=RuntimeError("no plugins")) is False
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +234,64 @@ class TestObjTransferManager:
         assert seen["params"] == given
         assert "max_inflight" not in seen["params"]
         assert "split_size" not in seen["params"]
+
+    def test_creates_the_named_backend(self):
+        from modelexpress.obj_transfer import ObjTransferManager
+
+        seen = {}
+
+        class _Agent:
+            name = "test"
+
+            def create_backend(self, backend, params):
+                seen["backend"] = backend
+
+        with patch.dict("os.environ", {"MX_OBJ_BACKEND": "REST"}), \
+             patch("modelexpress.obj_transfer.NIXL_AVAILABLE", True), \
+             patch("modelexpress.obj_transfer.NixlAgent", return_value=_Agent()), \
+             patch("modelexpress.obj_transfer.NixlAgentConfig"), \
+             patch("modelexpress.obj_transfer.NixlThreadSync"), \
+             patch("torch.cuda.current_device", return_value=0):
+            mgr = ObjTransferManager(agent_name="test", params={})
+            mgr.initialize()
+
+        assert seen["backend"] == "REST"
+        assert mgr.max_reg_bytes is None
+
+    def test_open_pool_rejects_a_pool_over_the_limit(self):
+        from modelexpress.obj_transfer import ObjTransferManager
+
+        mgr = ObjTransferManager(agent_name="test", params={}, backend="OBJ")
+        mgr._agent = object()
+        with pytest.raises(RuntimeError, match="registration limit"):
+            mgr.open_pool(mgr.max_reg_bytes + 1, torch.device("cpu"))
+
+
+class TestRedact:
+    """Secrets are recognised by parameter name, whatever the backend."""
+
+    def test_masks_credentials_of_any_backend(self):
+        from modelexpress.obj_transfer import _redact
+        params = {
+            "access_key": "a",
+            "secret_key": "s",
+            "session_token": "t",
+            "account_key": "k",
+            "bearer_token": "b",
+            "connection_string": "c",
+            "endpoint_override": "http://h:81",
+            "split_size": "8388608",
+        }
+        assert _redact(params) == {
+            "access_key": "***",
+            "secret_key": "***",
+            "session_token": "***",
+            "account_key": "***",
+            "bearer_token": "***",
+            "connection_string": "***",
+            "endpoint_override": "http://h:81",
+            "split_size": "8388608",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +423,10 @@ class _FakeManager:
     region of the pool each transfer landed in.
     """
 
-    def __init__(self):
+    def __init__(self, max_reg_bytes=None):
+        from modelexpress.obj_transfer import MAX_REG_BYTES
+
+        self.max_reg_bytes = MAX_REG_BYTES if max_reg_bytes is None else max_reg_bytes
         self.events = []
         self._seq = 0
         self._ranges = {}
@@ -540,6 +689,16 @@ class TestStagingBudget:
         a, b, c = _cuda_mem(free=512 * 1024 ** 3)
         with a, b, c, patch.dict("os.environ", {"MX_OBJ_STAGING_MB": "65536"}):
             assert loader._resolve_staging_budget(1024) == MAX_REG_BYTES
+
+    def test_unbounded_backend_is_not_registration_clamped(self):
+        # A backend without a single-registration limit (REST registers through
+        # ibverbs/DMA-BUF, not cuObject) may take an override past 4 GiB.
+        manager = _FakeManager()
+        manager.max_reg_bytes = None
+        loader = _loader(manager)
+        a, b, c = _cuda_mem(free=512 * 1024 ** 3)
+        with a, b, c, patch.dict("os.environ", {"MX_OBJ_STAGING_MB": "16384"}):
+            assert loader._resolve_staging_budget(1024) == 16 * 1024 ** 3
 
     def test_does_not_scale_with_free_vram(self):
         # The old formula took a share of free VRAM; the budget must now be the

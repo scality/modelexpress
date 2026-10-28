@@ -4,11 +4,11 @@
 """
 Framework-agnostic object-store model loader.
 
-Loads model weights from safetensors objects directly to GPU memory via
-NIXL's OBJ plugin, bypassing CPU bounce buffers. The OBJ plugin is
-engine-agnostic (plain S3, S3 CRT, or GPU-direct accelerated engines); the
-engine and its connection parameters are configured via MX_OBJ_PARAMS and
-are opaque to this loader.
+Loads model weights from safetensors objects directly to GPU memory via any
+NIXL backend that exposes object segments (OBJ_SEG), bypassing CPU bounce
+buffers. The backend is named by MX_OBJ_BACKEND (S3 ``OBJ`` by default,
+Scality ``REST``, ...) and configured via MX_OBJ_PARAMS; both are opaque to
+this loader.
 
 The set of shard objects and their names is resolved from the model's
 metadata (``model.safetensors.index.json`` / ``model.safetensors``) the same
@@ -41,6 +41,7 @@ from .obj_transfer import (
     ObjBatchHandle,
     ObjTransferManager,
     is_obj_available,
+    obj_backend_name,
 )
 from .safetensors_meta import (
     HEADER_LEN_SIZE,
@@ -76,8 +77,9 @@ _DEFAULT_GROUP_BYTES = 64 * 1024 * 1024
 # 4 GiB is what saturates a plausible cap: 512 concurrent requests of 8 MiB. Above
 # the cap the extra queue is idle bytes.
 #
-# Capped by what the backend will register in one call, since the pool is one
-# registration: an unreachable default is not a default.
+# Capped by what the cuObject-backed OBJ plugin will register in one call, since
+# the pool is one registration: an unreachable default is not a default. Kept for
+# every backend so the default does not depend on which one is configured.
 _MIN_STAGING_BYTES = min(4 * 1024 * 1024 * 1024, MAX_REG_BYTES)
 
 # Hard ceiling on the staging budget as a share of currently-free VRAM, so a
@@ -262,8 +264,8 @@ _ELEMENT_SIZES: dict[torch.dtype, int] = {}
 
 class MxObjLoader:
     """
-    Load model weights from safetensors objects directly to GPU via the
-    NIXL OBJ backend.
+    Load model weights from safetensors objects directly to GPU via a NIXL
+    object-segment backend.
 
     Framework-agnostic. Can be used from vLLM, sglang, or standalone.
 
@@ -305,8 +307,8 @@ class MxObjLoader:
 
         if not is_obj_available():
             raise RuntimeError(
-                "NIXL OBJ backend is not available. Check libplugin_OBJ.so "
-                "and MX_OBJ_ENDPOINT."
+                f"NIXL backend '{obj_backend_name()}' is not available or does not "
+                "expose OBJ_SEG. Check MX_OBJ_BACKEND and the NIXL install."
             )
 
         self._device_id = torch.cuda.current_device()
@@ -487,8 +489,9 @@ class MxObjLoader:
 
         # The pool is one registration, so it cannot exceed what the backend will
         # register. This clamp is last because the two above can raise the budget.
-        if budget > MAX_REG_BYTES:
-            budget = MAX_REG_BYTES
+        reg_limit = self._obj_manager.max_reg_bytes if self._obj_manager else None
+        if reg_limit is not None and budget > reg_limit:
+            budget = reg_limit
             source += ", registration-clamped"
 
         logger.info(

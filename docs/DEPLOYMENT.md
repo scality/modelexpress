@@ -402,11 +402,13 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
 | `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
 | `MX_OBJ_URI` | (unset) | Object key prefix where the model's safetensors shards live. Set to enable `ObjStrategy` — see [Object-Store (OBJ) Backend](#object-store-obj-backend). |
-| `MX_OBJ_PARAMS` | `{}` | JSON object of NIXL OBJ backend parameters, passed verbatim to the backend — ModelExpress adds nothing and overrides nothing, so any key left unset keeps the backend's own default. Selects the engine and its connection settings (`type`, `accelerated`, `endpoint_override`, `bucket`, `region`, `crtMinLimit`, `num_threads`, credentials, ...), and carries the two transfer knobs `split_size` and `max_inflight` — see [Throughput tuning](#throughput-tuning). See the NIXL OBJ plugin README for the full vocabulary. |
+| `MX_OBJ_BACKEND` | `OBJ` | NIXL backend (plugin) that `ObjStrategy` creates. Any plugin exposing `OBJ_SEG` works: `OBJ` (S3: plain, CRT, S3-accelerated engines), `REST` (Scality AI Connector), `AZURE_BLOB`, ... `ObjStrategy` is skipped if NIXL has no such plugin or it does not expose `OBJ_SEG`. |
+| `MX_OBJ_PARAMS` | `{}` | JSON object of parameters for the `MX_OBJ_BACKEND` backend, passed verbatim — ModelExpress adds nothing and overrides nothing except `dram_rdma`, so any key left unset keeps the backend's own default. Carries the connection settings (`endpoint_override`, `bucket`, `region`, credentials, `rdma_nics`, ...) and the two transfer knobs `split_size` and `max_inflight` — see [Throughput tuning](#throughput-tuning). See the backend's NIXL README for its vocabulary. |
+| `MX_OBJ_MAX_REG_MB` | (`OBJ`: just under 4096; other backends: unlimited) | Largest single memory registration the backend accepts, in MiB; caps the staging pool. `0` means no limit. The default limit comes from cuObject, which only the `OBJ` plugin registers through. |
 | `MX_OBJ_TIMEOUT` | `300` | OBJ transfer timeout in seconds, measured from when a transfer is posted. |
 | `MX_OBJ_GROUP_MB` | `64` | Target size of one OBJ transfer. Consecutive tensors in a shard are coalesced into contiguous groups of about this size, so one descriptor covers several tensors. Sets both the descriptor size the backend sees and the delivery granularity (a group's tensors become available together). |
-| `MX_OBJ_STAGING_MB` | (auto: `max(4096, largest group)`, capped at 50% of free VRAM) | GPU memory the loader may hold in staging buffers for groups requested but not yet consumed. Bounds memory only, not request count — its job is just to keep the backend's request queue non-empty, and 4 GiB covers 512 concurrent 8 MiB requests. Flat rather than a multiple of the largest group, because coalescing cannot split a tensor and one oversized tensor would otherwise set the budget for the whole model. A group bigger than the budget is always admitted. Capped at just under 4 GiB (the backend's single-registration limit) because the pool is one registration. |
-| `MX_OBJ_INTERLEAVE` | `0` | Issue transfers round-robin across shard objects instead of walking one object at a time. Which matters because the number of distinct objects the in-flight set touches is the staging window divided by the bytes behind each object — group size cancels out — and the window cannot exceed ~4 GiB because the pool is a single NIXL registration. A 51 GiB model in 15 shards puts 3.4 GiB per object, so object-order reading reaches ~1 object and every concurrent request contends on it; the same model in 127 shards reaches ~10. Measured on Gemma-3-27B: 26.8 GiB/s at 127 shards against 16.6 at 15, with request count, size, concurrency and rail balance identical. `1` makes the window span every object whatever the packing. Off by default pending a measurement of the interleaved order itself. |
+| `MX_OBJ_STAGING_MB` | (auto: `max(4096, largest group)`, capped at 50% of free VRAM) | GPU memory the loader may hold in staging buffers for groups requested but not yet consumed. Bounds memory only, not request count — its job is just to keep the backend's request queue non-empty, and 4 GiB covers 512 concurrent 8 MiB requests. Flat rather than a multiple of the largest group, because coalescing cannot split a tensor and one oversized tensor would otherwise set the budget for the whole model. A group bigger than the budget is always admitted. Capped by `MX_OBJ_MAX_REG_MB` (just under 4 GiB for `OBJ`) because the pool is one registration. |
+| `MX_OBJ_INTERLEAVE` | `0` | Issue transfers round-robin across shard objects instead of walking one object at a time. Which matters because the number of distinct objects the in-flight set touches is the staging window divided by the bytes behind each object — group size cancels out — and with the `OBJ` backend the window cannot exceed ~4 GiB because the pool is a single NIXL registration. A 51 GiB model in 15 shards puts 3.4 GiB per object, so object-order reading reaches ~1 object and every concurrent request contends on it; the same model in 127 shards reaches ~10. Measured on Gemma-3-27B: 26.8 GiB/s at 127 shards against 16.6 at 15, with request count, size, concurrency and rail balance identical. `1` makes the window span every object whatever the packing. Off by default pending a measurement of the interleaved order itself. |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
@@ -445,27 +447,28 @@ NIXL agent 'mx-auto-worker0-...' created on device 0 (backend=LIBFABRIC)
 ### Object-Store (OBJ) Backend
 
 `ObjStrategy` loads safetensors weights directly from an object store
-into GPU memory using the NIXL OBJ plugin. The plugin is
-engine-agnostic: the same strategy drives plain AWS S3, the
-high-performance S3 CRT client, or a GPU-direct accelerated engine
-(e.g. `dell`, `scality_ai_connector`). It is the zero-copy alternative
-to `ModelStreamerStrategy` (which stages through host memory), so it
-runs ahead of it in the chain.
+into GPU memory through any NIXL backend that exposes object segments
+(`OBJ_SEG`). It relies only on that memory type, so the same strategy
+drives the S3 `OBJ` plugin (plain AWS S3, the S3 CRT client, or an
+S3-accelerated engine such as `dell`), the Scality AI Connector's
+`REST` plugin, or `AZURE_BLOB`. It is the zero-copy alternative to
+`ModelStreamerStrategy` (which stages through host memory), so it runs
+ahead of it in the chain.
 
 Enable it by setting `MX_OBJ_URI` (the object key prefix for the
-model's shards) and `MX_OBJ_PARAMS` (a JSON map of OBJ backend
-parameters passed verbatim to the backend). The engine and its
-connection are selected entirely through `MX_OBJ_PARAMS`; ModelExpress
-does not hardcode any provider. Examples:
+model's shards), `MX_OBJ_BACKEND` (the NIXL plugin name, default `OBJ`)
+and `MX_OBJ_PARAMS` (a JSON map of that backend's parameters, passed
+verbatim). ModelExpress does not hardcode any provider. Examples:
 
 ```bash
 # Plain S3-compatible store
 export MX_OBJ_URI="my-models/llama-3-8b"
 export MX_OBJ_PARAMS='{"bucket":"my-models","region":"us-east-1","endpoint_override":"https://s3.example.com"}'
 
-# GPU-direct accelerated engine (RDMA), e.g. Scality AI Connector
+# Scality AI Connector (GPU-direct over RDMA)
 export MX_OBJ_URI="my-models/llama-3-8b"
-export MX_OBJ_PARAMS='{"accelerated":"true","type":"scality_ai_connector","endpoint_override":"http://10.0.0.1:81"}'
+export MX_OBJ_BACKEND=REST
+export MX_OBJ_PARAMS='{"endpoint_override":"http://10.0.0.1:81","rdma_nics":"mlx5_1,mlx5_2"}'
 ```
 
 The shard layout (`model.safetensors.index.json` / `model.safetensors`)
@@ -484,10 +487,10 @@ That leaves four knobs in two places.
 
 **Backend, via `MX_OBJ_PARAMS`:**
 
-- `split_size` (default 16 MB, `0` disables) — bytes per request. Each
-  descriptor becomes `ceil(size / split_size)` ranged GETs. This is the
-  primary throughput control; 16 MB is the measured optimum on Scality
-  RING over 1x100G.
+- `split_size` (backend default, 8 MiB for `REST`; `0` disables) —
+  bytes per request. Each descriptor becomes `ceil(size / split_size)`
+  ranged GETs. This is the primary throughput control; 16 MB is the
+  measured optimum on Scality RING over 1x100G.
 - `max_inflight` (default 512, `0` disables) — requests running
   concurrently. Requests beyond the cap wait in the connector and start
   as slots free, so throughput is preserved while file-descriptor use
@@ -524,9 +527,11 @@ tuning belongs to the backend, not the loader.
 - `MX_OBJ_STAGING_MB` — GPU memory held in staging buffers for groups
   requested but not yet consumed. Bounds memory only. Raise it if the
   backend runs dry between transfers; lower it if the engine is short of
-  VRAM during load. Values above ~4 GiB are clamped: the pool is a single
-  NIXL registration, and the backend rejects one larger than
+  VRAM during load. The pool is a single NIXL registration, so values
+  above `MX_OBJ_MAX_REG_MB` are clamped. For `OBJ` that is ~4 GiB: it
+  registers through cuObject, which rejects one larger than
   `CUOBJ_MAX_MEMORY_REG_SIZE` (4 GiB, or 4 GiB - 64 KiB since CUDA 13.3).
+  `REST` registers through ibverbs / DMA-BUF and has no such limit.
 
 A group is never split across transfers and a tensor is never split
 across groups, so a tensor larger than the target simply gets a group of
@@ -537,8 +542,9 @@ object contend on that object's placement, however many of them there
 are. How many distinct objects are in flight is the staging window
 divided by the bytes behind each object — group size cancels out, since
 halving it doubles both the groups in the window and the groups per
-object — and the window is capped near 4 GiB because the pool is a
-single NIXL registration.
+object — and with the `OBJ` backend the window is capped near 4 GiB
+because the pool is a single NIXL registration. Backends without that
+limit can widen the window with `MX_OBJ_STAGING_MB` instead.
 
 That makes shard count a throughput parameter. Measured on Gemma-3-27B,
 51.1 GiB, `max_inflight=128`, everything else identical:
@@ -559,8 +565,9 @@ range, and where a tensor's dtype could not be viewed at its offset
 within the group.
 
 ```bash
-export MX_OBJ_PARAMS='{"accelerated":"true","type":"scality_ai_connector",
-  "endpoint_override":"http://10.0.0.1:81","split_size":"16777216","max_inflight":"64"}'
+export MX_OBJ_BACKEND=REST
+export MX_OBJ_PARAMS='{"endpoint_override":"http://10.0.0.1:81",
+  "split_size":"16777216","max_inflight":"64"}'
 ```
 
 ##### How the pieces fit
@@ -612,15 +619,18 @@ touching anything else.
 
 Runtime prerequisites:
 
-- The NIXL OBJ plugin (`libplugin_OBJ.so`) must be loadable. Set
-  `NIXL_PLUGIN_DIR` to its directory if it is not on the default
-  plugin path.
-- Accelerated, GPU-direct engines additionally require NVIDIA cuObject
-  / GPUDirect Storage and an RDMA-capable fabric. Point
-  `CUFILE_ENV_PATH_JSON` at `/etc/cufile.json` with `rdma_dev_addr_list`
-  set for your fabric. Plain S3 / S3 CRT engines do not need cuObject.
+- NIXL must report the `MX_OBJ_BACKEND` plugin as available and
+  exposing `OBJ_SEG` (checked through NIXL's plugin discovery, which
+  honours `NIXL_PLUGIN_DIR`). The strategy logs which plugins it found
+  when the configured one is missing.
+- The backend's own prerequisites apply. S3-accelerated `OBJ` engines
+  require NVIDIA cuObject / GPUDirect Storage and an RDMA-capable
+  fabric; plain S3 / S3 CRT engines do not. `REST` requires a DC-capable
+  RDMA NIC (ConnectX) and DMA-BUF or `nvidia_peermem` for GPU memory.
+  Both read `rdma_dev_addr_list` from the `cufile.json` that
+  `CUFILE_ENV_PATH_JSON` points at when no NIC list is given.
 
-When `ObjStrategy` is unavailable (plugin missing, params unset, or a
+When `ObjStrategy` is unavailable (plugin missing or without `OBJ_SEG`, `MX_OBJ_URI` unset, or a
 backend prerequisite not ready) the chain transparently falls through
 to `ModelStreamerStrategy`, `GdsStrategy`, then the engine-native
 loader. After a successful OBJ load the worker registers its tensors

@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""OBJ loading strategy: object-store-to-GPU loading via the NIXL OBJ plugin.
+"""OBJ loading strategy: object-store-to-GPU loading via a NIXL object backend.
 
 Reads safetensors weights from an object store directly into GPU memory using
-the NIXL OBJ plugin (plain S3, S3 CRT, or a GPU-direct accelerated engine,
-selected via ``MX_OBJ_PARAMS``). The shard layout is resolved from the model
+any NIXL backend that exposes object segments (OBJ_SEG), named by
+``MX_OBJ_BACKEND`` (S3 ``OBJ`` by default, Scality ``REST``, ...) and configured
+via ``MX_OBJ_PARAMS``. The shard layout is resolved from the model
 metadata (``model_config.model``); the object key prefix comes from
 ``MX_OBJ_URI``.
 """
@@ -37,7 +38,7 @@ def _resolve_object_uri(ctx: LoadContext) -> str:
 
 
 class ObjStrategy(LoadStrategy):
-    """Load weights from object storage via the NIXL OBJ backend."""
+    """Load weights from object storage via a NIXL object-segment backend."""
 
     name = "obj"
     requires = (EngineAdapter.apply_weight_iter,)
